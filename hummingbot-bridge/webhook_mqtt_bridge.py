@@ -5,8 +5,8 @@ Updated to Remove Pool Address from MQTT Messages
 CRITICAL UPDATE: Removed pool_address field from MQTT messages as Gateway
 handles pool selection internally. Clean directional signals only.
 
-Author: Hummingbot 2.8.0 Webhook Automation Project
-Date: July 19, 2025
+Author: Todd Griggs
+Date: Sept 19, 2025
 Status: PRODUCTION READY - Clean Directional Signals
 """
 

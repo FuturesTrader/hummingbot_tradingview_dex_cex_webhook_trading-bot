@@ -8,16 +8,23 @@ GATEWAY 2.9.0
 - Pool type explicitly specified in routes
 
 Author: Todd Griggs
+Date: Sept 19, 2025
+
 """
 import time
+import datetime
+import traceback
+import pandas as pd
 import json
 import os
 import ssl
 import asyncio
 import aiohttp
+import re
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from typing import Union, Dict, List, Optional, Tuple, Any
+from urllib.parse import urlencode
 
 # Try importing MQTT with error handling
 try:
@@ -111,6 +118,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
         self.logger().info(f"🔐 Gateway certificates configured: cert={os.path.basename(self.gateway_cert_path)}")
 
         # Wallet Configuration
+        # Used to ensure we have a wallet to trade with
         self.arbitrum_wallet: str = os.getenv("HBOT_ARBITRUM_WALLET", "")
         self.solana_wallet: str = os.getenv("HBOT_SOLANA_WALLET", "")
 
@@ -213,7 +221,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
             if not self._initialized:
                 if not self._initializing:
                     self._initializing = True
-                    safe_ensure_future(self._initialize_strategy_configuration())
+                    safe_ensure_future(self._initialize_strategy())
                 # Always return during initialization to prevent any checks
                 return
 
@@ -290,13 +298,58 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
             self.logger().warning(f"⚠️ Configuration refresh error: {refresh_error}")
 
 
-    def _initialize_strategy(self):
-        """
-        Legacy initialization method - now redirects to async version
-        Maintains compatibility with existing code
-        """
-        self.logger().info("🔄 Starting strategy initialization...")
-        safe_ensure_future(self._initialize_strategy_configuration())
+    async def _initialize_strategy(self) -> None:
+        """Initialize strategy with Gateway 2.9 configuration"""
+        try:
+            if self._initialized:
+                self._initializing = False
+                return
+
+            self.logger().info("🚀 Initializing MQTT Webhook Strategy with Gateway 2.9 architecture")
+
+            if self.cex_enabled:
+                num_pairs = len(self.markets.get(self.cex_exchange_name, []))
+                self.logger().info(f"📊 CEX Mode: Subscribing to {num_pairs} trading pairs on {self.cex_exchange_name}")
+
+            # Step 1: Initialize supported networks
+            self.supported_networks = self._get_supported_networks()
+            self.logger().info(f"📋 Target networks: {', '.join(self.supported_networks)}")
+
+            # Step 2: Load Gateway 2.9 pool configurations
+            self.logger().info("🏊 Loading Gateway 2.9 pool configurations...")
+            await self._refresh_gateway_configuration()
+
+            # Step 3: Dynamic token discovery
+            self.logger().info("🔍 Starting dynamic token discovery...")
+            await self._initialize_dynamic_token_discovery()
+
+            self.logger().info("🔢 Loading token decimals...")
+            await self._load_token_decimals()
+
+            # Step 4: Initialize CEX connector if enabled
+            if self.cex_enabled:
+                self.logger().info("📈 Initializing CEX connector...")
+                await self._initialize_cex_connector()
+
+            # Step 5: Setup MQTT if available
+            if MQTT_AVAILABLE:
+                self.logger().info("📡 Setting up MQTT connection...")
+                self._setup_mqtt()
+            else:
+                self.logger().warning("⚠️ MQTT not available - webhook-only mode")
+
+            # Step 6: Log configuration summary
+            self._log_configuration_summary()
+
+            # Step 7: Mark as initialized
+            self._initialized = True
+            self._initializing = False
+            self.logger().info("✅ Strategy initialization complete with Gateway 2.9")
+
+        except Exception as init_error:
+            self.logger().error(f"❌ Strategy initialization error: {init_error}")
+            self._initializing = False
+            self._initialized = False
 
     async def _refresh_gateway_configuration(self) -> None:
         """
@@ -401,7 +454,6 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
     def _parse_pool_configurations(self, pools_config: Dict) -> None:
         """
         Parse Gateway 2.9.0 flat JSON pool structure
-        SIMPLIFIED: Direct parsing without nested YAML complexity
         """
         try:
             self.pool_configurations = {}
@@ -558,28 +610,6 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
         except Exception:
             return False  # Let Gateway handle unknown cases
 
-    async def _has_pool_for_signal(self, signal_data: Dict[str, Any]) -> bool:
-        """
-        Simplified pool check for Gateway 2.9
-        Just verify a pool exists, don't validate tokens separately
-        """
-        try:
-            network = signal_data.get("network")
-            exchange = signal_data.get("exchange")
-            symbol = signal_data.get("symbol")
-
-            # Parse symbol to get pool key
-            base_token, quote_token = self._parse_symbol_tokens(symbol, network)
-            pool_key = f"{base_token}-{quote_token}"
-
-            # Check if pool exists using unified method
-            pool_info = await self._get_pool_info(network, exchange, pool_key=pool_key)
-
-            return pool_info is not None
-
-        except Exception:
-            return False  # If we can't check, let Gateway handle it
-
     def _validate_symbol_format(self, symbol: str) -> bool:
         """
         Validate trading symbol format
@@ -590,7 +620,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                 return False
 
             # Allow alphanumeric characters, hyphens, slashes, and underscores
-            import re
+
             if not re.match(r'^[A-Za-z0-9\-/_]+$', symbol):
                 return False
 
@@ -612,91 +642,6 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
         except Exception as format_error:
             self.logger().error(f"❌ Symbol format validation error: {format_error}")
             return False
-
-    async def _get_token_address(self, token_symbol: str, network: str) -> str:
-        """
-        Get token address using the existing discovery infrastructure
-        """
-        try:
-            # Check cache first
-            network_cache = self.token_details_cache.get(network, {})
-            token_info = network_cache.get(token_symbol.upper())
-
-            if token_info and "address" in token_info:
-                return token_info["address"]
-
-            # Determine chain
-            chain = "solana" if self._is_solana_network(network) else "ethereum"
-
-            # Use the endpoint pattern
-            if chain == "ethereum":
-                tokens_response = await self.gateway_request("GET", f"/chains/ethereum/tokens?network={network}")
-            elif chain == "solana":
-                tokens_response = await self.gateway_request("GET", f"/chains/solana/tokens?network={network}")
-            else:
-                tokens_response = await self.gateway_request("GET", f"/chains/{chain}/tokens?network={network}")
-
-            if not self._is_successful_response(tokens_response):
-                self.logger().debug(f"No token response for {chain}/{network}")
-                return token_symbol  # Return symbol as fallback
-
-            # Parse the response
-            if "tokens" in tokens_response:
-                token_list = tokens_response["tokens"]
-                if isinstance(token_list, list):
-                    for token in token_list:
-                        if isinstance(token, dict):
-                            symbol = token.get("symbol", "").upper()
-                            address = token.get("address")
-
-                            # Cache the full token info
-                            if symbol and address:
-                                if network not in self.token_details_cache:
-                                    self.token_details_cache[network] = {}
-
-                                self.token_details_cache[network][symbol] = {
-                                    "address": address,
-                                    "decimals": token.get("decimals", 9 if chain == "solana" else 18),
-                                    "name": token.get("name", symbol)
-                                }
-
-                                # If this is our target token, return it
-                                if symbol == token_symbol.upper():
-                                    self.logger().debug(f"Found address for {token_symbol}: {address[:8]}...")
-                                    return address
-
-            # If not found, return symbol as fallback
-            self.logger().warning(f"Token address not found for {token_symbol}, using symbol")
-            return token_symbol
-
-        except Exception as e:
-            self.logger().error(f"Error getting token address for {token_symbol}: {e}")
-            return token_symbol
-
-    async def _get_pool_from_api(self, connector: str, network: str,
-                                 trading_pair: str, pool_type: str) -> Optional[Dict]:
-        """
-        Get pool information from Gateway 2.9.0 API
-        Uses the /pools/{trading_pair} endpoint
-        """
-        try:
-            response = await self.gateway_request(
-                "GET",
-                f"/pools/{trading_pair}",
-                params={
-                    "connector": connector,
-                    "network": network,
-                    "type": pool_type
-                }
-            )
-
-            if self._is_successful_response(response):
-                return response
-            return None
-
-        except Exception as e:
-            self.logger().error(f"❌ Pool API error: {e}")
-            return None
 
     class ConfigurationError(Exception):
         """
@@ -730,16 +675,6 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                 base_msg += details_str
 
             return base_msg
-
-        def to_dict(self) -> Dict:
-            """Convert exception to dictionary for logging/debugging"""
-            return {
-                "error_code": self.error_code,
-                "message": self.message,
-                "details": self.details,
-                "timestamp": self.timestamp,
-                "type": self.__class__.__name__
-            }
 
     def _setup_mqtt(self) -> None:
         """Set up MQTT client connection"""
@@ -828,7 +763,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                 self.logger().error(f"❌ Unsupported network: {network}")
                 return False
 
-            # FIXED: Enhanced symbol validation for CEX vs DEX
+            # symbol validation for CEX vs DEX
             symbol = signal_data.get("symbol", "")
             exchange = signal_data.get("exchange", "").lower()
 
@@ -858,58 +793,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
             self.logger().error(f"❌ Signal validation error: {validation_error}")
             return False
 
-    async def _initialize_strategy_configuration(self) -> None:
-        """Initialize strategy with Gateway 2.9 configuration"""
-        try:
-            if self._initialized:
-                self._initializing = False
-                return
 
-            self.logger().info("🚀 Initializing MQTT Webhook Strategy with Gateway 2.9 architecture")
-
-            if self.cex_enabled:
-                num_pairs = len(self.markets.get(self.cex_exchange_name, []))
-                self.logger().info(f"📊 CEX Mode: Subscribing to {num_pairs} trading pairs on {self.cex_exchange_name}")
-
-            # Step 1: Initialize supported networks
-            self.supported_networks = self._get_supported_networks()
-            self.logger().info(f"📋 Target networks: {', '.join(self.supported_networks)}")
-
-            # Step 2: Load Gateway 2.9 pool configurations
-            self.logger().info("🏊 Loading Gateway 2.9 pool configurations...")
-            await self._refresh_gateway_configuration()
-
-            # Step 3: Dynamic token discovery
-            self.logger().info("🔍 Starting dynamic token discovery...")
-            await self._initialize_dynamic_token_discovery()
-
-            self.logger().info("🔢 Loading token decimals...")
-            await self._load_token_decimals()
-
-            # Step 4: Initialize CEX connector if enabled
-            if self.cex_enabled:
-                self.logger().info("📈 Initializing CEX connector...")
-                await self._initialize_cex_connector()
-
-            # Step 5: Setup MQTT if available
-            if MQTT_AVAILABLE:
-                self.logger().info("📡 Setting up MQTT connection...")
-                self._setup_mqtt()
-            else:
-                self.logger().warning("⚠️ MQTT not available - webhook-only mode")
-
-            # Step 6: Log configuration summary
-            self._log_configuration_summary()
-
-            # Step 7: Mark as initialized
-            self._initialized = True
-            self._initializing = False
-            self.logger().info("✅ Strategy initialization complete with Gateway 2.9")
-
-        except Exception as init_error:
-            self.logger().error(f"❌ Strategy initialization error: {init_error}")
-            self._initializing = False
-            self._initialized = False
 
     async def _initialize_cex_connector(self):
         """
@@ -955,180 +839,6 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
             self.logger().error(f"❌ CEX initialization error: {cex_error}")
             self.cex_enabled = False
             self._cex_init_completed = True
-
-    async def _get_cex_balance(self, token: str, wait_for_pending: bool = True) -> Decimal:
-        """
-        Get CEX balance with smart retry logic and pending order awareness
-        FIXED: Better handling of None responses and initialization
-        """
-        try:
-            # First, ensure CEX connector is ready
-            if not self.cex_connector:
-                self.logger().error("❌ CEX connector not available")
-                return Decimal("0")
-
-            # Check if connector is still initializing
-            if not self.cex_ready:
-                self.logger().warning(f"⚠️ CEX connector still initializing, waiting...")
-                # Wait a bit for connector to be ready
-                for i in range(10):
-                    await asyncio.sleep(1)
-                    if self.cex_ready:
-                        break
-
-                if not self.cex_ready:
-                    self.logger().error(f"❌ CEX connector not ready after waiting")
-                    return Decimal("0")
-
-            # Check if we should wait for a pending buy order to settle
-            if wait_for_pending and self._pending_balances and token in self._pending_balances:
-                pending = self._pending_balances[token]
-                time_since_order = time.time() - pending['timestamp']
-
-                # If order was placed less than 30 seconds ago, wait for settlement
-                if time_since_order < 30:
-                    self.logger().info(
-                        f"⏳ Waiting for {token} balance to settle (order placed {time_since_order:.1f}s ago)...")
-
-                    # Wait up to 15 seconds for balance to appear
-                    max_wait = 15
-                    wait_interval = 0.5
-                    iterations = int(max_wait / wait_interval)
-
-                    for i in range(iterations):
-                        # Get current balance with None check
-                        try:
-                            balances = self.cex_connector.get_all_balances()
-                            if asyncio.iscoroutine(balances):
-                                balances = await balances
-
-                            # CRITICAL FIX: Check if balances is None
-                            if balances is None:
-                                self.logger().debug(f"⚠️ Connector returned None for balances, retrying...")
-                                await asyncio.sleep(wait_interval)
-                                continue
-
-                            # Check type of balances
-                            if not isinstance(balances, dict):
-                                self.logger().warning(f"⚠️ Unexpected balance type: {type(balances)}")
-                                await asyncio.sleep(wait_interval)
-                                continue
-
-                            # Now safe to get balance from dict
-                            balance = balances.get(token, Decimal("0"))
-
-                            # If we got a non-zero balance, we're done
-                            if balance > 0:
-                                self.logger().info(f"✅ {token} balance settled: {float(balance):.8f}")
-                                # Clean up pending balance tracking
-                                del self._pending_balances[token]
-                                return balance
-
-                            # Show progress every 2 seconds
-                            if i > 0 and i % 4 == 0:
-                                self.logger().info(f"⏳ Still waiting for {token} balance... ({i * wait_interval:.1f}s)")
-
-                        except (AttributeError, TypeError) as e:
-                            self.logger().debug(f"⚠️ Balance query error during settlement wait: {e}")
-                            await asyncio.sleep(wait_interval)
-                            continue
-
-                        await asyncio.sleep(wait_interval)
-
-                    # Timeout - clean up and try one more time
-                    self.logger().warning(f"⚠️ {token} balance didn't settle within {max_wait}s")
-                    del self._pending_balances[token]
-
-            # Normal balance query with simple retry logic
-            max_retries = 5  # Increased from 3 for better reliability
-            retry_delay = 1.0
-
-            for attempt in range(max_retries):
-                try:
-                    # Try to force a balance refresh if the connector supports it
-                    if attempt > 0 and hasattr(self.cex_connector, 'update_balances'):
-                        try:
-                            await self.cex_connector.update_balances()
-                        except Exception as e:
-                            self.logger().debug(f"Could not force balance update: {e}")
-
-                    # Get balances
-                    balances = self.cex_connector.get_all_balances()
-                    if asyncio.iscoroutine(balances):
-                        balances = await balances
-
-                    # CRITICAL FIX: Check if balances is None or not a dict
-                    if balances is None:
-                        if attempt < max_retries - 1:
-                            self.logger().warning(
-                                f"⚠️ Connector returned None for balances (attempt {attempt + 1}/{max_retries})")
-                            await asyncio.sleep(retry_delay)
-                            retry_delay = min(retry_delay * 1.5, 5.0)  # Exponential backoff with cap
-                            continue
-                        else:
-                            self.logger().error(f"❌ Connector returned None after {max_retries} attempts")
-                            return Decimal("0")
-
-                    # Ensure balances is a dict
-                    if not isinstance(balances, dict):
-                        self.logger().warning(f"⚠️ Unexpected balance type: {type(balances)}")
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(retry_delay)
-                            retry_delay = min(retry_delay * 1.5, 5.0)
-                            continue
-                        else:
-                            self.logger().error(f"❌ Invalid balance type after {max_retries} attempts")
-                            return Decimal("0")
-
-                    raw_balance = balances.get(token, Decimal("0"))
-
-                    # Convert to Decimal if needed (explicitly handle all types)
-                    if isinstance(raw_balance, Decimal):
-                        balance = raw_balance
-                    elif raw_balance is None:
-                        balance = Decimal("0")
-                    else:
-                        # Convert any other type (float, int, str) to Decimal
-                        balance = Decimal(str(raw_balance))
-
-                    # Log the result
-                    if balance > 0:
-                        self.logger().info(f"💰 {token} balance: {float(balance):.8f}")
-                    elif attempt == max_retries - 1:
-                        self.logger().info(f"💰 {token} balance: 0")
-
-                    return balance
-
-                except (AttributeError, TypeError) as e:
-                    # This is the specific error you're seeing
-                    if "NoneType" in str(e):
-                        self.logger().warning(f"⚠️ Connector returned None, attempt {attempt + 1}/{max_retries}")
-                    else:
-                        self.logger().warning(f"⚠️ Balance query error: {e}, attempt {attempt + 1}/{max_retries}")
-
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(retry_delay)
-                        retry_delay = min(retry_delay * 1.5, 5.0)
-                    else:
-                        self.logger().error(f"❌ Failed to get {token} balance after {max_retries} attempts: {e}")
-                        return Decimal("0")
-
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        self.logger().warning(f"⚠️ Error getting balance, retrying... ({e})")
-                        await asyncio.sleep(retry_delay)
-                        retry_delay = min(retry_delay * 1.5, 5.0)
-                    else:
-                        self.logger().error(f"❌ Failed to get {token} balance after {max_retries} attempts: {e}")
-                        return Decimal("0")
-
-            return Decimal("0")
-
-        except Exception as e:
-            self.logger().error(f"❌ Unexpected error getting {token} balance: {e}")
-            import traceback
-            self.logger().debug(f"Traceback: {traceback.format_exc()}")
-            return Decimal("0")
 
     async def _ensure_cex_ready(self, timeout: float = 10.0) -> bool:
         """
@@ -1485,7 +1195,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
 
         except Exception as e:
             self.logger().error(f"❌ Signal processing error: {e}")
-            import traceback
+
             self.logger().error(traceback.format_exc())
 
     async def _route_to_cex(self, action: str, symbol: str, signal_data: Dict) -> bool:
@@ -1985,7 +1695,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                     base_token, network, exchange, trade_amount, pool_address
                 )
 
-            # ⭐ ENHANCEMENT: Track position for sell trade
+            # ⭐ Track position for sell trade
             if success:
                 self._track_buy_position(
                     base_token=base_token,
@@ -2499,7 +2209,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                 self.logger().debug(f"📊 Target token {base_token} has {target_token_decimals} decimals")
 
                 # IMPROVED: Better decimal handling for USDC amount
-                from decimal import Decimal, ROUND_DOWN
+
 
                 # Convert to Decimal for precise handling
                 trade_amount_decimal = Decimal(str(amount))
@@ -2546,6 +2256,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                 target_base_amount = 0.0
 
                 # For 0x router, BUY operations need different logic than pool-based DEXs
+                # Experimental.  initial tests are failing
                 if is_router_dex:
                     # 0x router: BUY WBTC means we want to buy WBTC using USDC
                     # First get current price to calculate how much WBTC we can buy with our USD amount
@@ -2611,7 +2322,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
 
                     # CRITICAL FIX: Format the expected output based on target token decimals
                     if target_token_decimals >= 8:
-                        # For high decimal tokens like WBTC (8 decimals), limit precision
+                        # Example: For high decimal tokens like WBTC (8 decimals), limit precision
                         max_precision = min(target_token_decimals, 8)
                         expected_output = round(expected_output_raw, max_precision)
                     else:
@@ -2690,7 +2401,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
 
                 endpoint = f"/connectors/{exchange.lower()}/{pool_type}/execute-swap"
 
-                # IMPROVED: Use the clean string for logging
+                #  Use the clean string for logging
                 self.logger().info(
                     f"📤 EVM BUY: Swapping {trade_amount:.{usdc_decimals}f} USDC → {base_token} on {network}")
 
@@ -2726,7 +2437,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                         }
                     return True
 
-                # ERROR HANDLING WITH SMART RETRIES
+                # ERROR HANDLING WITH RETRIES
                 error_msg = str(response.get("message", response.get("error", ""))).lower()
 
                 if "max fee per gas less than block base fee" in error_msg or "gas price" in error_msg:
@@ -2819,9 +2530,6 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                 # Calculate sell amount
                 sell_amount_raw = float(balance_response) * (percentage / 100.0)
 
-                # CRITICAL FIX: Handle high-precision tokens (like WETH with 18 decimals)
-                from decimal import Decimal, ROUND_DOWN
-
                 # Convert to Decimal for precise handling
                 sell_amount_decimal = Decimal(str(sell_amount_raw))
 
@@ -2896,7 +2604,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                                     pool_type = p_type
                                     break
 
-                # CRITICAL FIX: Get a price quote first to calculate proper minimum output
+                # Get a price quote first to calculate proper minimum output
                 if is_router_dex:
                     # Router DEXs use /router/ prefix in endpoint structure
                     quote_endpoint = f"/connectors/{exchange.lower()}/router/quote-swap"
@@ -3015,7 +2723,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                 if "max fee per gas less than block base fee" in error_msg or "gas price" in error_msg:
                     if attempt < max_retries - 1:
                         # Extract actual required gas from error
-                        import re
+
                         base_fee_match = re.search(r'baseFee:\s*(\d+)', error_msg)
                         max_fee_match = re.search(r'maxFeePerGas:\s*(\d+)', error_msg)
 
@@ -3068,7 +2776,6 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
 
             except Exception as e:
                 self.logger().error(f"❌ EVM SELL trade error: {e}")
-                import traceback
                 self.logger().debug(f"Traceback: {traceback.format_exc()}")
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2)
@@ -3264,7 +2971,6 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
 
         except Exception as e:
             self.logger().error(f"❌ SELL error: {e}")
-            import traceback
             self.logger().debug(traceback.format_exc())
             return False
 
@@ -3304,17 +3010,6 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
 
         self.logger().warning(f"⚠️ Could not parse {symbol}, defaulting to {symbol}-USDC")
         return symbol.upper(), 'USDC'
-
-        "may not need this method"
-    def _convert_symbol_to_pool_format(self, symbol: str, network: str) -> str:
-        """
-        Convert trading symbol to pool format example:
-
-        SOLPEPE -> SOL-PEPE
-        PEPESOL -> PEPE-SOL
-        """
-        base, quote = self._parse_symbol_tokens(symbol, network)
-        return f"{base}-{quote}"
 
     async def _get_token_price_in_usd(self, token: str, network: str, exchange: str = "raydium") -> Optional[Decimal]:
         """
@@ -3461,7 +3156,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
     def _get_fallback_price(self, token: str) -> Decimal:
         """
         Get fallback price for token when live price unavailable
-        Updated with current approximate prices (August 2025)
+        Only used in edge situations when we see network issues
         """
         fallback_prices = {
             # Major tokens
@@ -3504,10 +3199,10 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
         """
         Get token price in USD with special handling for SOL and tokens without USDC pairs
 
-        CRITICAL:
         - SOL-USDC pool is in CLMM
         - Many tokens only have SOL pairs, not USDC pairs
         - Need to calculate USD price through SOL bridge
+        - This method is kind of messy but it is reliable
         """
         try:
             # Special handling for stablecoins
@@ -3793,38 +3488,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
 
         return explorer_urls.get(network, f"https://etherscan.io/tx/{tx_hash}")
 
-    async def _discover_available_tokens_for_network(self, network: str) -> List[str]:
-        """Discover tokens for network - updated for Gateway 2.9 endpoints"""
-        try:
-            chain = "solana" if self._is_solana_network(network) else "ethereum"
 
-            # Gateway 2.9: Updated endpoint
-            endpoint = f"/chains/{chain}/tokens"
-            tokens_response = await self.gateway_request("GET", endpoint, params={"network": network})
-
-            if not self._is_successful_response(tokens_response):
-                return []
-
-            tokens = []
-            if "tokens" in tokens_response:
-                token_list = tokens_response["tokens"]
-                if isinstance(token_list, list):
-                    for token in token_list:
-                        if isinstance(token, dict) and "symbol" in token:
-                            symbol = token["symbol"]
-                            if symbol and symbol not in tokens:
-                                tokens.append(symbol)
-                        elif isinstance(token, str):
-                            if token not in tokens:
-                                tokens.append(token)
-
-            return tokens
-
-        except Exception as e:
-            self.logger().error(f"❌ Token discovery error: {e}")
-            return []
-
-    from typing import Optional
 
     async def _initialize_dynamic_token_discovery(self) -> None:
         """
@@ -3890,7 +3554,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
             return None
 
         try:
-            # ===== REALITY CHECK: Gateway 2.9.0 Response Format =====
+            # ===== Gateway 2.9.0 Response Format =====
             # Gateway uses 'signature' field for BOTH EVM and Solana (discovered through testing)
             signature = response.get("signature")
             if signature and isinstance(signature, str) and len(signature) > 10:
@@ -3952,7 +3616,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                               params: Optional[Dict] = None) -> Dict:
         """
         Gateway 2.9.0 compatible request method with proper query parameter handling
-        FIXED: Handle 500 errors with signatures (Solana timeout cases)
+        Handle 500 errors with signatures (Solana timeout cases)
         """
         try:
             protocol = "https" if self.gateway_https else "http"
@@ -3965,7 +3629,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
 
             # Handle query parameters for GET requests
             if method.upper() == "GET" and params:
-                from urllib.parse import urlencode
+
                 query_string = urlencode(params)
                 url = f"{base_url}?{query_string}"
             else:
@@ -4057,7 +3721,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                 self.logger().debug(f"🔍 Response message indicates error: {message}")
                 return False
 
-            # ✅ FIXED: Recognize successful TRADE responses (Gateway 2.9.0 format)
+            # Recognize successful TRADE responses (Gateway 2.9.0 format)
             # Gateway 2.9.0 uses 'signature' field for both EVM and Solana successful trades
             if "signature" in response:
                 signature = response.get("signature")
@@ -4082,26 +3746,26 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                 self.logger().debug(f"✅ Trade response has {success_count} success indicators")
                 return True
 
-            # ✅ FIXED: For Gateway configuration responses
+            # For Gateway configuration responses
             if "networks" in response:
                 networks = response["networks"]
                 if isinstance(networks, dict) and len(networks) > 0:
                     self.logger().debug(f"✅ Config response contains {len(networks)} networks")
                     return True
 
-            # ✅ FIXED: For token/connector responses
+            # For token/connector responses
             if "tokens" in response or "connectors" in response:
                 self.logger().debug("✅ Token/connector response detected")
                 return True
 
-            # ✅ FIXED: For balance responses
+            #  For balance responses
             if "balances" in response:
                 balances = response["balances"]
                 if isinstance(balances, dict):
                     self.logger().debug(f"✅ Balance response contains {len(balances)} balances")
                     return True
 
-            # ✅ FIXED: For empty but valid responses (like status checks)
+            # For empty but valid responses (like status checks)
             if len(response) > 0 and not any(key in response for key in ["error", "message"]):
                 self.logger().debug(f"✅ Non-empty response without errors: {list(response.keys())}")
                 return True
@@ -4302,7 +3966,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
 
         # Last signal time
         if hasattr(self, 'last_signal_time') and self.last_signal_time:
-            import datetime
+
             time_diff = datetime.datetime.now(datetime.timezone.utc) - self.last_signal_time
             lines.append(f"  Last Signal: {time_diff.seconds//60}m {time_diff.seconds%60}s ago")
 
@@ -4338,10 +4002,9 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
 
     def active_orders_df(self):
         """
-        Return DataFrame of active positions (since this strategy doesn't use traditional orders)
+        Return DataFrame of active positions
         This shows current positions as 'active orders' for the status display
         """
-        import pandas as pd
 
         if not hasattr(self, 'active_positions') or not self.active_positions:
             raise ValueError("No active positions")
@@ -4378,7 +4041,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
             return "Unknown"
 
         try:
-            from datetime import datetime, timezone
+
             pos_time = position.get('timestamp')
             if isinstance(pos_time, str):
                 # Parse timestamp string if needed
