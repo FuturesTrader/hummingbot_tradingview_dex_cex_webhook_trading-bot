@@ -8,7 +8,7 @@ GATEWAY 2.9.0
 - Pool type explicitly specified in routes
 
 Author: Todd Griggs
-Date: Sept 29, 2025
+Date: Sept 19, 2025
 
 """
 import time
@@ -2825,15 +2825,31 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
 
                 # If no pool provided, find one
                 else:
-                    pool_key = f"{base_token}-{quote_token}"
-                    pool_info = await self._get_pool_info(network, exchange, pool_key=pool_key)
+                    # Special handling for Jupiter - it's a router and doesn't need pool lookup
+                    if exchange and exchange.lower() == "jupiter":
+                        pool_type = "router"
+                        pool = None
+                        self.logger().info(f"📋 Jupiter router detected - no pool address needed for {base_token}-{quote_token}")
+                    else:
+                        pool_key = f"{base_token}-{quote_token}"
+                        pool_info = await self._get_pool_info(network, exchange, pool_key=pool_key)
 
-                    if pool_info:
-                        pool = pool_info['address']
-                        pool_type = pool_info['type']
-                        if pool_info.get('quote_token'):
-                            quote_token = pool_info['quote_token']
-                        self.logger().info(f"📋 Found {pool_type} pool: {pool[:10]}...")
+                        if pool_info:
+                            pool = pool_info['address']
+                            pool_type = pool_info['type']
+                            if pool_info.get('quote_token'):
+                                quote_token = pool_info['quote_token']
+
+                            # Handle router-based exchanges (Jupiter) that don't use pool addresses
+                            if pool_type == 'router' or pool is None:
+                                self.logger().info(f"📋 Found {pool_type} configuration for {base_token}-{quote_token}")
+                            else:
+                                self.logger().info(f"📋 Found {pool_type} pool: {pool[:10]}...")
+                        else:
+                            # pool_info is None - handle gracefully
+                            self.logger().warning(f"⚠️ No pool configuration found for {base_token}-{quote_token} on {exchange}")
+                            pool = None
+                            pool_type = None
 
                 # Final fallback for pool type
                 if not pool_type:
@@ -2841,8 +2857,12 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                     pool_type = "amm"
                     self.logger().info(f"📋 Using default AMM for Solana trading")
 
-            # Step 2: Get balance
+            # Step 2: Get balance with guaranteed initialization
             balance = await self._get_token_balance(base_token, network)
+
+            # Ensure balance is always a number, never None
+            if balance is None:
+                balance = 0
 
             if not balance or balance <= 0:
                 # Retry with direct Gateway call
@@ -2857,8 +2877,17 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
 
                 response = await self.gateway_request("POST", "/chains/solana/balances", balance_request)
 
-                if response and "balances" in response:
-                    balance = float(response["balances"].get(base_token, 0))
+                if response and "balances" in response and response["balances"] is not None:
+                    balances_dict = response["balances"]
+                    if isinstance(balances_dict, dict):
+                        balance = float(balances_dict.get(base_token, 0))
+                    else:
+                        self.logger().warning(f"⚠️ Balances response is not a dict: {type(balances_dict)}")
+                        balance = 0
+                else:
+                    # If Gateway response is None or invalid, set balance to 0
+                    self.logger().warning(f"⚠️ Gateway balance response invalid for {base_token}")
+                    balance = 0
 
                 if not balance or balance <= 0:
                     self.logger().warning(f"⚠️ No {base_token} balance to sell")
@@ -3429,7 +3458,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
 
             response = await self.gateway_request("POST", endpoint, balance_request)
 
-            if response and "balances" in response:
+            if response and "balances" in response and response["balances"] is not None:
                 balance = float(response["balances"].get(token_symbol, 0))
                 self.logger().debug(f"💰 {token_symbol} balance on {network}: {balance}")
                 return balance
