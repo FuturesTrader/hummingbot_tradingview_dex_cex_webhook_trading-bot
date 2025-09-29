@@ -6,7 +6,7 @@ CRITICAL UPDATE: Removed pool_address field from MQTT messages as Gateway
 handles pool selection internally. Clean directional signals only.
 
 Author: Todd Griggs
-Date: Sept 19, 2025
+Date: Sept 28, 2025
 Status: PRODUCTION READY - Clean Directional Signals
 """
 
