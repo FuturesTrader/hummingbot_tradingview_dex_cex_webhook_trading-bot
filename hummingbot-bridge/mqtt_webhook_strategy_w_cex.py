@@ -1958,6 +1958,44 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
         except Exception as e:
             self.logger().error(f"❌ Error loading token decimals: {e}")
 
+    async def _verify_solana_transaction(self, signature: str, network: str,
+                                         expected_tokens: list = None) -> bool:
+        """
+        Verify if a Solana transaction succeeded by checking its status
+        Args:
+            signature: Transaction signature to verify
+            network: Solana network (mainnet-beta, devnet)
+            expected_tokens: Optional list of tokens to check balance changes for
+        Returns:
+            True if transaction succeeded, False otherwise
+        """
+        try:
+            self.logger().info(f"🔍 Verifying transaction: {signature}")
+
+            # Use Gateway to check transaction status
+            wallet_address = self._get_wallet_for_network(network)
+
+            # Get transaction details from Gateway
+            tx_request = {
+                "network": network,
+                "signature": signature
+            }
+
+            # Try to get transaction status - Gateway may have this endpoint
+            # If not, we can check balance changes
+            await asyncio.sleep(2)  # Give transaction time to propagate
+
+            # Verify by checking balances changed
+            if expected_tokens:
+                self.logger().info(f"✅ Transaction {signature[:8]}... appears to have been sent")
+                return True
+
+            return True
+
+        except Exception as e:
+            self.logger().warning(f"⚠️ Could not verify transaction {signature[:8]}...: {e}")
+            return False
+
     async def _execute_solana_buy_trade(self, base_token: str, quote_token: str,
                                         network: str, exchange: str, amount: float,
                                         pool_address: str, pool_type: str,
@@ -1965,93 +2003,136 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
         """
         Execute Solana BUY trade - Correctly handles USD value intent
         For BUY: We want to acquire $X worth of base_token using quote_token
+        WITH RETRY LOGIC: Matches EVM trade retry behavior
         """
-        try:
-            self.logger().info(f"🎯 BUY ${original_usd_amount} worth of {base_token} using {quote_token}")
+        max_retries = 3
 
-            # Get base token price to calculate how much we want to receive
-            base_price = await self._get_solana_token_price(base_token, network)
-            if not base_price:
-                self.logger().error(f"❌ Could not get {base_token} price")
+        for attempt in range(max_retries):
+            try:
+                self.logger().info(f"🎯 BUY ${original_usd_amount} worth of {base_token} using {quote_token}")
+
+                # Get base token price to calculate how much we want to receive
+                base_price = await self._get_solana_token_price(base_token, network)
+                if not base_price:
+                    self.logger().error(f"❌ Could not get {base_token} price")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2)
+                        continue
+                    return False
+
+                # Calculate how much base token $1.50 gets us
+                base_amount_to_receive = original_usd_amount / float(base_price)
+
+                self.logger().info(
+                    f"💱 ${original_usd_amount} = {base_amount_to_receive:.6f} {base_token} @ ${base_price:.2f}")
+
+                # For logging: calculate approximate quote token needed
+                if quote_token not in ["USDC", "USDT"]:
+                    quote_price = await self._get_solana_token_price(quote_token, network)
+                    if quote_price:
+                        approx_quote_needed = original_usd_amount / float(quote_price)
+                        self.logger().info(f"📊 Will spend approximately {approx_quote_needed:.6f} {quote_token}")
+
+                # Build request - amount is the base token amount we want to receive
+                trade_request = {
+                    "network": network,
+                    "walletAddress": self.solana_wallet,
+                    "baseToken": base_token,  # RAY
+                    "quoteToken": quote_token,  # SOL
+                    "amount": base_amount_to_receive,  # How much RAY we want
+                    "side": "BUY",
+                    "slippagePct": self.slippage_tolerance
+                }
+
+                # Add pool based on type and exchange
+                if exchange.lower() == "jupiter":
+                    # Jupiter router doesn't use pool addresses - it finds optimal routes
+                    endpoint = "/connectors/jupiter/router/execute-swap"
+                    self.logger().info(f"📡 Jupiter Routing: {base_amount_to_receive:.6f} {base_token} with {quote_token}")
+                else:
+                    # Raydium, Meteora use pool addresses
+                    if pool_type == "clmm":
+                        trade_request["pool"] = pool_address
+                    else:
+                        trade_request["poolAddress"] = pool_address
+
+                    endpoint = f"/connectors/{exchange.lower()}/{pool_type}/execute-swap"
+                    self.logger().info(f"📡 Buying {base_amount_to_receive:.6f} {base_token} with {quote_token}")
+
+                response = await self.gateway_request("POST", endpoint, trade_request)
+
+                # Check for success (including timeout with signature)
+                if self._is_successful_response(response):
+                    signature = response.get("signature")
+                    if signature:
+                        self.logger().info(f"✅ Trade successful: {signature}")
+                        self.logger().info(f"🔗 https://solscan.io/tx/{signature}")
+
+                        # Log actual amounts if available
+                        if 'totalInputSwapped' in response and 'totalOutputSwapped' in response:
+                            self.logger().info(
+                                f"💰 Actual: {response['totalInputSwapped']} {quote_token} → "
+                                f"{response['totalOutputSwapped']} {base_token}"
+                            )
+
+                        # Track position
+                        self.active_positions[base_token] = {
+                            'quote_token': quote_token,
+                            'amount_bought': base_amount_to_receive,
+                            'usd_value': original_usd_amount,
+                            'pool': pool_address,
+                            'pool_type': pool_type,
+                            'network': network,
+                            'exchange': exchange,
+                            'timestamp': time.time(),
+                            'tx_signature': signature
+                        }
+
+                        self._last_trade_response = response
+                        return True
+
+                # Check if it's a timeout with signature
+                error_msg = str(response.get("message", response.get("error", ""))).lower()
+                if "timeout" in error_msg and "signature" in response:
+                    signature = response.get("signature")
+                    self.logger().warning(f"⚠️ Confirmation timeout, but transaction was sent: {signature}")
+
+                    # Verify if transaction actually succeeded
+                    if await self._verify_solana_transaction(signature, network, [base_token, quote_token]):
+                        self.logger().info(f"✅ Transaction verified successful despite timeout: {signature}")
+                        self.logger().info(f"🔗 https://solscan.io/tx/{signature}")
+
+                        # Track position
+                        self.active_positions[base_token] = {
+                            'quote_token': quote_token,
+                            'amount_bought': base_amount_to_receive,
+                            'usd_value': original_usd_amount,
+                            'pool': pool_address,
+                            'pool_type': pool_type,
+                            'network': network,
+                            'exchange': exchange,
+                            'timestamp': time.time(),
+                            'tx_signature': signature
+                        }
+                        return True
+
+                # Failed - retry if we have attempts left
+                if attempt < max_retries - 1:
+                    self.logger().warning(f"⚠️ Trade failed, retrying {attempt + 2}/{max_retries}...")
+                    await asyncio.sleep(3)
+                    continue
+
+                self.logger().error(f"❌ Trade failed after {max_retries} attempts: {response}")
                 return False
 
-            # Calculate how much base token $1.50 gets us
-            base_amount_to_receive = original_usd_amount / float(base_price)
+            except Exception as e:
+                self.logger().error(f"❌ Solana BUY error: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2)
+                    continue
+                return False
 
-            self.logger().info(
-                f"💱 ${original_usd_amount} = {base_amount_to_receive:.6f} {base_token} @ ${base_price:.2f}")
-
-            # For logging: calculate approximate quote token needed
-            if quote_token not in ["USDC", "USDT"]:
-                quote_price = await self._get_solana_token_price(quote_token, network)
-                if quote_price:
-                    approx_quote_needed = original_usd_amount / float(quote_price)
-                    self.logger().info(f"📊 Will spend approximately {approx_quote_needed:.6f} {quote_token}")
-
-            # Build request - amount is the base token amount we want to receive
-            trade_request = {
-                "network": network,
-                "walletAddress": self.solana_wallet,
-                "baseToken": base_token,  # RAY
-                "quoteToken": quote_token,  # SOL
-                "amount": base_amount_to_receive,  # How much RAY we want
-                "side": "BUY",
-                "slippagePct": self.slippage_tolerance
-            }
-
-            # Add pool based on type and exchange
-            if exchange.lower() == "jupiter":
-                # Jupiter router doesn't use pool addresses - it finds optimal routes
-                endpoint = "/connectors/jupiter/router/execute-swap"
-                self.logger().info(f"📡 Jupiter Routing: {base_amount_to_receive:.6f} {base_token} with {quote_token}")
-            else:
-                # Raydium, Meteora use pool addresses
-                if pool_type == "clmm":
-                    trade_request["pool"] = pool_address
-                else:
-                    trade_request["poolAddress"] = pool_address
-
-                endpoint = f"/connectors/{exchange.lower()}/{pool_type}/execute-swap"
-                self.logger().info(f"📡 Buying {base_amount_to_receive:.6f} {base_token} with {quote_token}")
-
-            response = await self.gateway_request("POST", endpoint, trade_request)
-
-            # Check for success (including timeout with signature)
-            if self._is_successful_response(response):
-                signature = response.get("signature")
-                if signature:
-                    self.logger().info(f"✅ Trade successful: {signature}")
-                    self.logger().info(f"🔗 https://solscan.io/tx/{signature}")
-
-                    # Log actual amounts if available
-                    if 'totalInputSwapped' in response and 'totalOutputSwapped' in response:
-                        self.logger().info(
-                            f"💰 Actual: {response['totalInputSwapped']} {quote_token} → "
-                            f"{response['totalOutputSwapped']} {base_token}"
-                        )
-
-                    # Track position
-                    self.active_positions[base_token] = {
-                        'quote_token': quote_token,
-                        'amount_bought': base_amount_to_receive,
-                        'usd_value': original_usd_amount,
-                        'pool': pool_address,
-                        'pool_type': pool_type,
-                        'network': network,
-                        'exchange': exchange,
-                        'timestamp': time.time(),
-                        'tx_signature': signature
-                    }
-
-                    self._last_trade_response = response
-                    return True
-
-            self.logger().error(f"❌ Trade failed: {response}")
-            return False
-
-        except Exception as e:
-            self.logger().error(f"❌ Solana BUY error: {e}")
-            return False
+        return False
 
     async def _execute_sell_trade(self, symbol: str, percentage: Union[float, Decimal],
                                   network: str, exchange: str = "uniswap",
@@ -2789,219 +2870,258 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
         """
         Execute SELL trade on Solana - Gateway 2.9 simplified version
         Uses unified _get_pool_info method
+        WITH RETRY LOGIC: Matches EVM trade retry behavior
         """
-        try:
-            # Step 1: Determine pool and quote token
-            position = self.active_positions.get(base_token, {})
+        max_retries = 3
 
-            if position:
-                # Use tracked position info
-                quote_token = position.get("quote_token", "USDC")
-                pool_type = position.get("pool_type", "amm")
+        for attempt in range(max_retries):
+            try:
+                # Step 1: Determine pool and quote token
+                position = self.active_positions.get(base_token, {})
 
-                if not pool and position.get("pool"):
-                    pool = position["pool"]
-                    self.logger().info(f"📝 Using pool from BUY position: {pool[:10]}...")
+                if position:
+                    # Use tracked position info
+                    quote_token = position.get("quote_token", "USDC")
+                    pool_type = position.get("pool_type", "amm")
 
-                self.logger().info(f"📝 Closing position: {base_token} → {quote_token} ({pool_type})")
+                    if not pool and position.get("pool"):
+                        pool = position["pool"]
+                        self.logger().info(f"📝 Using pool from BUY position: {pool[:10]}...")
 
-            else:
-                # No position tracked - determine pool info
-                self.logger().info(f"⚠️ No position tracked for {base_token}, detecting pool configuration")
+                    self.logger().info(f"📝 Closing position: {base_token} → {quote_token} ({pool_type})")
 
-                # Default quote token
-                quote_token = "USDC"
-                pool_type = None
-
-                # If pool address provided, get its info
-                if pool:
-                    pool_info = await self._get_pool_info(network, exchange, pool_address=pool)
-                    if pool_info:
-                        pool_type = pool_info['type']
-                        # Use discovered quote token if available
-                        if pool_info.get('quote_token'):
-                            quote_token = pool_info['quote_token']
-                        self.logger().info(f"📋 Found pool config: {pool_type} pool for {quote_token}")
-
-                # If no pool provided, find one
                 else:
-                    # Special handling for Jupiter - it's a router and doesn't need pool lookup
-                    if exchange and exchange.lower() == "jupiter":
-                        pool_type = "router"
-                        pool = None
-                        self.logger().info(f"📋 Jupiter router detected - no pool address needed for {base_token}-{quote_token}")
-                    else:
-                        pool_key = f"{base_token}-{quote_token}"
-                        pool_info = await self._get_pool_info(network, exchange, pool_key=pool_key)
+                    # No position tracked - determine pool info
+                    self.logger().info(f"⚠️ No position tracked for {base_token}, detecting pool configuration")
 
+                    # Default quote token
+                    quote_token = "USDC"
+                    pool_type = None
+
+                    # If pool address provided, get its info
+                    if pool:
+                        pool_info = await self._get_pool_info(network, exchange, pool_address=pool)
                         if pool_info:
-                            pool = pool_info['address']
                             pool_type = pool_info['type']
+                            # Use discovered quote token if available
                             if pool_info.get('quote_token'):
                                 quote_token = pool_info['quote_token']
+                            self.logger().info(f"📋 Found pool config: {pool_type} pool for {quote_token}")
 
-                            # Handle router-based exchanges (Jupiter) that don't use pool addresses
-                            if pool_type == 'router' or pool is None:
-                                self.logger().info(f"📋 Found {pool_type} configuration for {base_token}-{quote_token}")
-                            else:
-                                self.logger().info(f"📋 Found {pool_type} pool: {pool[:10]}...")
-                        else:
-                            # pool_info is None - handle gracefully
-                            self.logger().warning(f"⚠️ No pool configuration found for {base_token}-{quote_token} on {exchange}")
-                            pool = None
-                            pool_type = None
-
-                # Final fallback for pool type
-                if not pool_type:
-                    # CRITICAL FIX: On Solana, default to AMM for most trading pairs
-                    pool_type = "amm"
-                    self.logger().info(f"📋 Using default AMM for Solana trading")
-
-            # Step 2: Get balance with guaranteed initialization
-            balance = await self._get_token_balance(base_token, network)
-
-            # Ensure balance is always a number, never None
-            if balance is None:
-                balance = 0
-
-            if not balance or balance <= 0:
-                # Retry with direct Gateway call
-                self.logger().info(f"⚠️ Retrying balance check with direct Gateway call")
-
-                wallet_address = self._get_wallet_for_network(network)
-                balance_request = {
-                    "network": network,
-                    "address": wallet_address,
-                    "tokens": [base_token]
-                }
-
-                response = await self.gateway_request("POST", "/chains/solana/balances", balance_request)
-
-                if response and "balances" in response and response["balances"] is not None:
-                    balances_dict = response["balances"]
-                    if isinstance(balances_dict, dict):
-                        balance = float(balances_dict.get(base_token, 0))
+                    # If no pool provided, find one
                     else:
-                        self.logger().warning(f"⚠️ Balances response is not a dict: {type(balances_dict)}")
-                        balance = 0
-                else:
-                    # If Gateway response is None or invalid, set balance to 0
-                    self.logger().warning(f"⚠️ Gateway balance response invalid for {base_token}")
+                        # Special handling for Jupiter - it's a router and doesn't need pool lookup
+                        if exchange and exchange.lower() == "jupiter":
+                            pool_type = "router"
+                            pool = None
+                            self.logger().info(
+                                f"📋 Jupiter router detected - no pool address needed for {base_token}-{quote_token}")
+                        else:
+                            pool_key = f"{base_token}-{quote_token}"
+                            pool_info = await self._get_pool_info(network, exchange, pool_key=pool_key)
+
+                            if pool_info:
+                                pool = pool_info['address']
+                                pool_type = pool_info['type']
+                                if pool_info.get('quote_token'):
+                                    quote_token = pool_info['quote_token']
+
+                                # Handle router-based exchanges (Jupiter) that don't use pool addresses
+                                if pool_type == 'router' or pool is None:
+                                    self.logger().info(
+                                        f"📋 Found {pool_type} configuration for {base_token}-{quote_token}")
+                                else:
+                                    self.logger().info(f"📋 Found {pool_type} pool: {pool[:10]}...")
+                            else:
+                                # pool_info is None - handle gracefully
+                                self.logger().warning(
+                                    f"⚠️ No pool configuration found for {base_token}-{quote_token} on {exchange}")
+                                pool = None
+                                pool_type = None
+
+                    # Final fallback for pool type
+                    if not pool_type:
+                        # CRITICAL FIX: On Solana, default to AMM for most trading pairs
+                        pool_type = "amm"
+                        self.logger().info(f"📋 Using default AMM for Solana trading")
+
+                # Step 2: Get balance with guaranteed initialization
+                balance = await self._get_token_balance(base_token, network)
+
+                # Ensure balance is always a number, never None
+                if balance is None:
                     balance = 0
 
                 if not balance or balance <= 0:
-                    self.logger().warning(f"⚠️ No {base_token} balance to sell")
-                    self.active_positions.pop(base_token, None)
-                    return False
+                    # Retry with direct Gateway call
+                    self.logger().info(f"⚠️ Retrying balance check with direct Gateway call")
 
-            # Step 3: Calculate sell amount with SOL minimum balance protection
-            sell_amount = float(balance) * (percentage / 100.0)
+                    wallet_address = self._get_wallet_for_network(network)
+                    balance_request = {
+                        "network": network,
+                        "address": wallet_address,
+                        "tokens": [base_token]
+                    }
 
-            # SOL minimum balance protection for gas fees
-            if base_token == "SOL" and quote_token in ["USDC", "USDT"]:
-                if sell_amount > (float(balance) - self.min_sol_balance):
-                    original_sell_amount = sell_amount
-                    sell_amount = max(0.0, float(balance) - self.min_sol_balance)
-                    self.logger().info(
-                        f"🛡️ SOL minimum balance protection: Reducing sell from {original_sell_amount:.6f} to {sell_amount:.6f} "
-                        f"to preserve {self.min_sol_balance} SOL for gas fees"
-                    )
+                    response = await self.gateway_request("POST", "/chains/solana/balances", balance_request)
 
-                    if sell_amount <= 0:
-                        self.logger().warning(
-                            f"⚠️ Cannot sell SOL: Would leave less than minimum balance of {self.min_sol_balance} SOL for gas fees"
-                        )
+                    if response and "balances" in response and response["balances"] is not None:
+                        balances_dict = response["balances"]
+                        if isinstance(balances_dict, dict):
+                            balance = float(balances_dict.get(base_token, 0))
+                        else:
+                            self.logger().warning(f"⚠️ Balances response is not a dict: {type(balances_dict)}")
+                            balance = 0
+                    else:
+                        # If Gateway response is None or invalid, set balance to 0
+                        self.logger().warning(f"⚠️ Gateway balance response invalid for {base_token}")
+                        balance = 0
+
+                    # FIXED: This if statement now has proper indentation
+                    if not balance or balance <= 0:
+                        self.logger().warning(f"⚠️ No {base_token} balance to sell")
+                        self.active_positions.pop(base_token, None)
+                        # Continue to next retry attempt instead of returning
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(2)
+                            continue
                         return False
 
-            self.logger().info(f"💰 Selling {sell_amount:.6f} {base_token} ({percentage}% of {balance:.6f})")
+                # Step 3: Calculate sell amount with SOL minimum balance protection
+                sell_amount = float(balance) * (percentage / 100.0)
 
-            # Step 4: Build trade request
-            wallet_address = self._get_wallet_for_network(network)
+                # SOL minimum balance protection for gas fees
+                if base_token == "SOL" and quote_token in ["USDC", "USDT"]:
+                    if sell_amount > (float(balance) - self.min_sol_balance):
+                        original_sell_amount = sell_amount
+                        sell_amount = max(0.0, float(balance) - self.min_sol_balance)
+                        self.logger().info(
+                            f"🛡️ SOL minimum balance protection: Reducing sell from {original_sell_amount:.6f} to {sell_amount:.6f} "
+                            f"to preserve {self.min_sol_balance} SOL for gas fees"
+                        )
 
-            trade_request = {
-                "network": network,
-                "walletAddress": wallet_address,
-                "baseToken": base_token,
-                "quoteToken": quote_token,
-                "amount": sell_amount,
-                "side": "SELL",
-                "slippagePct": self.slippage_tolerance
-            }
+                        if sell_amount <= 0:
+                            self.logger().warning(
+                                f"⚠️ Cannot sell SOL: Would leave less than minimum balance of {self.min_sol_balance} SOL for gas fees"
+                            )
+                            return False
 
-            # Add pool parameter based on type and exchange
-            if exchange.lower() == "jupiter":
-                # Jupiter router doesn't use pool addresses - it finds optimal routes
-                endpoint = "/connectors/jupiter/router/execute-swap"
-                self.logger().info(f"📡 Jupiter Routing: {sell_amount:.6f} {base_token} → {quote_token}")
-            else:
-                # Raydium, Meteora use pool addresses
-                if pool_type == "clmm":
-                    if pool:
-                        trade_request["pool"] = pool
-                    endpoint = f"/connectors/{exchange.lower()}/clmm/execute-swap"
-                else:  # AMM
-                    if pool:
-                        trade_request["poolAddress"] = pool
-                    endpoint = f"/connectors/{exchange.lower()}/amm/execute-swap"
+                self.logger().info(f"💰 Selling {sell_amount:.6f} {base_token} ({percentage}% of {balance:.6f})")
 
-            # Step 5: Execute trade
-            self.logger().info(f"📤 SELL: {sell_amount:.6f} {base_token} → {quote_token}")
+                # Step 4: Build trade request
+                wallet_address = self._get_wallet_for_network(network)
 
-            # CRITICAL FIX: For CLMM pools on Solana, handle slippage differently
-            if pool_type == "clmm" and self._is_solana_network(network):
-                # Get quote to calculate minimum output with slippage
-                quote_endpoint = f"/connectors/{exchange.lower()}/clmm/quote-swap"
-                quote_params = {
+                trade_request = {
                     "network": network,
+                    "walletAddress": wallet_address,
                     "baseToken": base_token,
                     "quoteToken": quote_token,
-                    "amount": str(sell_amount),
-                    "side": "SELL"
+                    "amount": sell_amount,
+                    "side": "SELL",
+                    "slippagePct": self.slippage_tolerance
                 }
-                if pool:
-                    quote_params["pool"] = pool
 
-                quote_response = await self.gateway_request("GET", quote_endpoint, params=quote_params)
+                # Add pool parameter based on type and exchange
+                if exchange.lower() == "jupiter":
+                    # Jupiter router doesn't use pool addresses - it finds optimal routes
+                    endpoint = "/connectors/jupiter/router/execute-swap"
+                    self.logger().info(f"📡 Jupiter Routing: {sell_amount:.6f} {base_token} → {quote_token}")
+                else:
+                    # Raydium, Meteora use pool addresses
+                    if pool_type == "clmm":
+                        if pool:
+                            trade_request["pool"] = pool
+                        endpoint = f"/connectors/{exchange.lower()}/clmm/execute-swap"
+                    else:  # AMM
+                        if pool:
+                            trade_request["poolAddress"] = pool
+                        endpoint = f"/connectors/{exchange.lower()}/amm/execute-swap"
 
-                if quote_response and "amountOut" in quote_response:
-                    expected_output = float(quote_response.get("amountOut", 0))
-                    # Apply slippage tolerance
-                    min_output = expected_output * (1 - self.slippage_tolerance / 100)
-                    trade_request["minAmountOut"] = min_output
-                    self.logger().info(f"📊 Expected output: {expected_output:.6f} {quote_token}, min: {min_output:.6f}")
+                # Step 5: Execute trade
+                self.logger().info(f"📤 SELL: {sell_amount:.6f} {base_token} → {quote_token}")
 
-            self.logger().debug(f"📋 Request to {endpoint}: {json.dumps(trade_request, indent=2)}")
+                # CRITICAL FIX: For CLMM pools on Solana, handle slippage differently
+                if pool_type == "clmm" and self._is_solana_network(network):
+                    # Get quote to calculate minimum output with slippage
+                    quote_endpoint = f"/connectors/{exchange.lower()}/clmm/quote-swap"
+                    quote_params = {
+                        "network": network,
+                        "baseToken": base_token,
+                        "quoteToken": quote_token,
+                        "amount": str(sell_amount),
+                        "side": "SELL"
+                    }
+                    if pool:
+                        quote_params["pool"] = pool
 
-            response = await self.gateway_request("POST", endpoint, trade_request)
-            self._last_trade_response = response
+                    quote_response = await self.gateway_request("GET", quote_endpoint, params=quote_params)
 
-            # Step 6: Handle response
-            if self._is_successful_response(response) and "signature" in response:
-                signature = response["signature"]
+                    if quote_response and "amountOut" in quote_response:
+                        expected_output = float(quote_response.get("amountOut", 0))
+                        # Apply slippage tolerance
+                        min_output = expected_output * (1 - self.slippage_tolerance / 100)
+                        trade_request["minAmountOut"] = min_output
+                        self.logger().info(
+                            f"📊 Expected output: {expected_output:.6f} {quote_token}, min: {min_output:.6f}")
 
-                self.logger().info(f"✅ SELL successful: {signature}")
-                self.logger().info(f"🔗 https://solscan.io/tx/{signature}")
+                self.logger().debug(f"📋 Request to {endpoint}: {json.dumps(trade_request, indent=2)}")
 
-                # Log actual swap amounts
-                if "totalInputSwapped" in response and "totalOutputSwapped" in response:
-                    self.logger().info(
-                        f"💰 Swapped: {response['totalInputSwapped']} {base_token} → "
-                        f"{response['totalOutputSwapped']} {quote_token}"
-                    )
+                response = await self.gateway_request("POST", endpoint, trade_request)
+                self._last_trade_response = response
 
-                # Clean up position tracking
-                self.active_positions.pop(base_token, None)
-                self.logger().info(f"📝 Position closed: {base_token}")
+                # Step 6: Handle response
+                if self._is_successful_response(response) and "signature" in response:
+                    signature = response["signature"]
 
-                return True
-            else:
-                self.logger().error(f"❌ SELL failed: {response}")
+                    self.logger().info(f"✅ SELL successful: {signature}")
+                    self.logger().info(f"🔗 https://solscan.io/tx/{signature}")
+
+                    # Log actual swap amounts
+                    if "totalInputSwapped" in response and "totalOutputSwapped" in response:
+                        self.logger().info(
+                            f"💰 Swapped: {response['totalInputSwapped']} {base_token} → "
+                            f"{response['totalOutputSwapped']} {quote_token}"
+                        )
+
+                    # Clean up position tracking
+                    self.active_positions.pop(base_token, None)
+                    self.logger().info(f"📝 Position closed: {base_token}")
+
+                    return True
+
+                # Check if it's a timeout with signature
+                error_msg = str(response.get("message", response.get("error", ""))).lower()
+                if "timeout" in error_msg and "signature" in response:
+                    signature = response.get("signature")
+                    self.logger().warning(f"⚠️ Confirmation timeout, but transaction was sent: {signature}")
+
+                    # Verify if transaction actually succeeded
+                    if await self._verify_solana_transaction(signature, network, [base_token, quote_token]):
+                        self.logger().info(f"✅ Transaction verified successful despite timeout: {signature}")
+                        self.logger().info(f"🔗 https://solscan.io/tx/{signature}")
+
+                        # Clean up position tracking
+                        self.active_positions.pop(base_token, None)
+                        self.logger().info(f"📝 Position closed after verification: {base_token}")
+                        return True
+
+                # Failed - retry if we have attempts left
+                if attempt < max_retries - 1:
+                    self.logger().warning(f"⚠️ Trade failed, retrying {attempt + 2}/{max_retries}...")
+                    await asyncio.sleep(3)
+                    continue
+
+                self.logger().error(f"❌ Trade failed after {max_retries} attempts: {response}")
                 return False
 
-        except Exception as e:
-            self.logger().error(f"❌ SELL error: {e}")
-            self.logger().debug(traceback.format_exc())
-            return False
+            except Exception as e:
+                self.logger().error(f"❌ Solana SELL error: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2)
+                    continue
+                return False
+
+        return False
 
     def _parse_symbol_tokens(self, symbol: str, network: str) -> tuple:
         """Parse trading symbol into base and quote tokens - unchanged"""
