@@ -22,7 +22,7 @@ import asyncio
 import aiohttp
 import re
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal
 from typing import Union, Dict, List, Optional, Tuple, Any
 from urllib.parse import urlencode
 
@@ -38,7 +38,10 @@ except ImportError:
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.data_type.common import OrderType
+from hummingbot.core.event.events import OrderFilledEvent
 from hummingbot.client.hummingbot_application import HummingbotApplication
+from hummingbot.core.rate_oracle.rate_oracle import RateOracle
+from hummingbot.connector.gateway.core.gateway_network_adapter import GatewayNetworkAdapter
 
 class ConfigurationError(Exception):
     """Specific exception for Gateway configuration errors - Phase 9.5 Single Source of Truth"""
@@ -47,12 +50,25 @@ class ConfigurationError(Exception):
 class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
     """Enhanced MQTT webhook strategy with Gateway 2.9 configuration integration"""
 
-    # Required framework attributes
+    # Required framework attributes - CEX and DEX connectors
+    # Gateway connectors use format: "{name}/{type}" (e.g., "jupiter/router", "uniswap/amm")
+    # These are registered by GatewayHttpClient when it connects to Gateway (see gateway_http_client.py:212)
+    # Network configuration is handled by Gateway internally
     markets = {
+        # CEX connector
         os.getenv("HBOT_CEX_DEFAULT_EXCHANGE", "coinbase_advanced_trade"): os.getenv(
             "HBOT_CEX_TRADING_PAIRS",
-            "ETH-USD,BTC-USD,SOL-USD,ADA-USD,MATIC-USD,LINK-USD,UNI-USD,AVAX-USD,DOT-USD,ATOM-USD,PEPE-USD,XRP-USD,CRO-USD"
-        ).split(",")
+            "ETH-USD,BTC-USD,SOL-USD,ADA-USD,MATIC-USD,LINK-USD,UNI-USD,AVAX-USD,ATOM-USD,PEPE-USD,XRP-USD,CRO-USD"
+        ).split(","),
+
+        # Gateway DEX connectors - Use format: {name}/{type}
+        # These names must match what Gateway returns via /config/connectors endpoint
+        "jupiter/router": set(),     # Jupiter (Solana router)
+        "raydium/amm": set(),        # Raydium AMM
+        "raydium/clmm": set(),       # Raydium CLMM
+        "meteora/clmm": set(),       # Meteora CLMM
+        "uniswap/amm": set(),        # Uniswap V2-style AMM
+        "uniswap/clmm": set(),       # Uniswap V3 CLMM
     }
 
     def __init__(self, connectors: Optional[Dict] = None):
@@ -154,6 +170,10 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
 
         # Transaction history tracking
         self.transaction_history: List[Dict[str, Any]] = []
+
+        # DEX order tracking for event handling
+        # Maps order_id -> {signal_data, exchange, pool_type, trading_pair, timestamp}
+        self._dex_order_tracking: Dict[str, Dict[str, Any]] = {}
         self.balance_cache: Dict[str, Tuple[float, float]] = {}  # {token: (balance, timestamp)}
 
         # transaction hash response
@@ -173,6 +193,10 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
 
         # Store app reference for CEX connector access
         self.app = HummingbotApplication.main_application()
+
+        # Dynamic network-specific connector cache
+        # Format: {f"{exchange}/{pool_type}/{network}": connector_instance}
+        #self._network_connectors: Dict[str, Any] = {}
 
         """Add these configuration options to __init__"""
         # Predictive selling configuration.  This is experimental and is used for very quick unintended buy/sell cycles
@@ -208,8 +232,159 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
 
     @classmethod
     def init_markets(cls, config=None):
-        """Framework compliance method - Gateway handles market initialization"""
-        return {}  # Return empty dict for Gateway-based strategies
+        """
+        Optional: Can be used to modify markets at config load time.
+        The markets dict is already set as a class attribute above, so this is optional.
+        If you need to dynamically configure markets based on config, you can do it here.
+        """
+        pass  # markets already set as class attribute
+
+    def _get_dex_connector(self, exchange: str, pool_type: str = None, network: str = None) -> Optional[Any]:
+        """
+        Get DEX connector from pre-declared framework-managed connectors with network adapter.
+        The framework creates, starts (with clock), and registers all connectors
+        declared in init_markets() with MarketsRecorder automatically.
+
+        This method wraps connectors with GatewayNetworkAdapter to enable dynamic
+        network switching based on MQTT signal network parameter.
+
+        Args:
+            exchange: Exchange name (e.g., 'jupiter', 'raydium', 'uniswap')
+            pool_type: Pool type ('router', 'amm', 'clmm'). If None, tries to infer.
+            network: Network name (e.g., 'arbitrum', 'mainnet', 'base'). Used for network override.
+
+        Returns:
+            GatewayNetworkAdapter wrapping the connector, or None if connector not found
+        """
+        try:
+            # Auto-detect pool type for router-based exchanges
+            if exchange.lower() in ['jupiter', '0x']:
+                pool_type = 'router'
+
+            # If still no pool type, default to 'amm'
+            if not pool_type:
+                pool_type = 'amm'
+
+            # Build connector key in format "exchange/type" (WITHOUT network)
+            # Network is NOT part of the connector key - it's a parameter for Gateway API calls
+            # Gateway connectors are registered as "jupiter/router", "uniswap/clmm", etc.
+            connector_key = f"{exchange.lower()}/{pool_type}"
+
+            # Look up connector in framework-managed connectors
+            if connector_key in self.connectors:
+                base_connector = self.connectors[connector_key]
+
+                # Wrap with network adapter to enable dynamic network switching
+                adapter = GatewayNetworkAdapter(base_connector, network)
+
+                self.logger().debug(
+                    f"✅ Found connector: {connector_key} "
+                    f"(network: {network or 'default'}, adapter: {adapter.network})"
+                )
+
+                return adapter
+            else:
+                self.logger().warning(f"⚠️ Connector not found: {connector_key}")
+                self.logger().debug(f"Available connectors: {list(self.connectors.keys())}")
+                return None
+
+        except Exception as e:
+            self.logger().error(f"❌ Error getting connector for {exchange}/{pool_type}: {e}")
+            return None
+
+    def did_fill_order(self, event: OrderFilledEvent):
+        """
+        Event handler called when a DEX order is filled.
+        This method is automatically triggered by the connector framework when trades complete.
+        The MarketsRecorder will automatically persist this event to the TradeFill database table.
+
+        Args:
+            event: OrderFilledEvent containing trade details (price, amount, fees, tx hash, etc.)
+        """
+        try:
+            # Check if this is one of our tracked DEX orders
+            if event.order_id not in self._dex_order_tracking:
+                # Not our order, ignore (might be CEX order or from another strategy)
+                return
+
+            # Retrieve trade context
+            order_info = self._dex_order_tracking[event.order_id]
+            exchange = order_info.get("exchange")
+            pool_type = order_info.get("pool_type")
+            signal_data = order_info.get("signal_data", {})
+            base_token = order_info.get("base_token")
+            trading_pair = event.trading_pair
+
+            # Build log message
+            log_msg = (
+                f"✅ DEX Order Filled: {event.trade_type.name} {trading_pair} on {exchange}/{pool_type}\n"
+                f"   Order ID: {event.order_id}\n"
+                f"   Amount: {event.amount}\n"
+                f"   Price: {event.price}\n"
+                f"   Fee: {event.trade_fee}\n"
+                f"   TX Hash: {event.exchange_trade_id}"
+            )
+
+            # Only add signal info if we have valid signal data
+            if signal_data and signal_data.get('action') and signal_data.get('token'):
+                log_msg += f"\n   Signal: {signal_data['action']} {signal_data['token']}"
+
+            self.logger().info(log_msg)
+
+            # Clean up position tracking for SELL orders
+            if event.trade_type.name == "SELL" and base_token:
+                if base_token in self.active_positions:
+                    del self.active_positions[base_token]
+                    self.logger().info(f"📝 Position closed: {base_token}")
+
+            # Clean up tracking entry
+            del self._dex_order_tracking[event.order_id]
+
+            # Note: MarketsRecorder automatically persists this event to database
+            # No manual database writes needed - the framework handles it
+
+        except Exception as e:
+            self.logger().error(f"❌ Error in did_fill_order handler: {e}", exc_info=True)
+
+    async def _update_rate_oracle_for_dex_positions(self):
+        """
+        Update RateOracle with current DEX prices for active positions.
+        This fixes the rate oracle warnings by injecting DEX prices so the performance
+        module can calculate PNL correctly.
+
+        Called periodically in on_tick() to keep prices fresh.
+        """
+        try:
+            if not self.active_positions:
+                return
+
+            rate_oracle = RateOracle.get_instance()
+
+            for base_token, position in self.active_positions.items():
+                try:
+                    quote_token = position.get('quote_token', 'USDC')
+                    network = position.get('network')
+
+                    # Get current price from DEX
+                    price = None
+                    if self._is_solana_network(network):
+                        price = await self._get_solana_token_price(base_token, network)
+                    else:
+                        exchange = position.get('exchange', 'uniswap')
+                        price = await self._get_token_price_in_usd(base_token, network, exchange)
+
+                    if price:
+                        # Inject price into rate oracle
+                        # Format: "BASE-QUOTE" (e.g., "RAY-USDC")
+                        pair = f"{base_token}-{quote_token}"
+                        rate_oracle.set_price(pair, Decimal(str(price)))
+                        self.logger().debug(f"📊 Updated rate oracle: {pair} = ${price:.6f}")
+
+                except Exception as e:
+                    self.logger().debug(f"⚠️ Could not update rate oracle for {base_token}: {e}")
+
+        except Exception as e:
+            self.logger().debug(f"⚠️ Rate oracle update error: {e}")
 
     def on_tick(self):
         """
@@ -277,6 +452,14 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                 if self.predictive_stats['attempts'] > 0:
                     self.log_predictive_stats()
                 self._last_predictive_stats_log = current_time
+
+            # Update rate oracle with DEX prices for active positions (every 10 seconds)
+            if not hasattr(self, '_last_rate_oracle_update'):
+                self._last_rate_oracle_update = current_time
+
+            if current_time - self._last_rate_oracle_update > 10:  # Update every 10 seconds
+                safe_ensure_future(self._update_rate_oracle_for_dex_positions())
+                self._last_rate_oracle_update = current_time
 
             time_since_refresh = current_time - self._last_config_refresh
             if time_since_refresh > 300:  # 5 minutes
@@ -1958,181 +2141,107 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
         except Exception as e:
             self.logger().error(f"❌ Error loading token decimals: {e}")
 
-    async def _verify_solana_transaction(self, signature: str, network: str,
-                                         expected_tokens: list = None) -> bool:
-        """
-        Verify if a Solana transaction succeeded by checking its status
-        Args:
-            signature: Transaction signature to verify
-            network: Solana network (mainnet-beta, devnet)
-            expected_tokens: Optional list of tokens to check balance changes for
-        Returns:
-            True if transaction succeeded, False otherwise
-        """
-        try:
-            self.logger().info(f"🔍 Verifying transaction: {signature}")
-
-            # Use Gateway to check transaction status
-            wallet_address = self._get_wallet_for_network(network)
-
-            # Get transaction details from Gateway
-            tx_request = {
-                "network": network,
-                "signature": signature
-            }
-
-            # Try to get transaction status - Gateway may have this endpoint
-            # If not, we can check balance changes
-            await asyncio.sleep(2)  # Give transaction time to propagate
-
-            # Verify by checking balances changed
-            if expected_tokens:
-                self.logger().info(f"✅ Transaction {signature[:8]}... appears to have been sent")
-                return True
-
-            return True
-
-        except Exception as e:
-            self.logger().warning(f"⚠️ Could not verify transaction {signature[:8]}...: {e}")
-            return False
-
     async def _execute_solana_buy_trade(self, base_token: str, quote_token: str,
                                         network: str, exchange: str, amount: float,
                                         pool_address: str, pool_type: str,
-                                        original_usd_amount: float) -> bool:
+                                        original_usd_amount: float, signal_data: dict = None) -> bool:
         """
-        Execute Solana BUY trade - Correctly handles USD value intent
+        Execute Solana BUY trade using connector framework (event-driven approach).
         For BUY: We want to acquire $X worth of base_token using quote_token
-        WITH RETRY LOGIC: Matches EVM trade retry behavior
+
+        This method now uses connector.place_order() which:
+        - Triggers OrderFilledEvent when complete
+        - Automatically records to database via MarketsRecorder
+        - Handles retries and timeouts internally
+
+        Args:
+            signal_data: Original signal data for tracking purposes
         """
-        max_retries = 3
+        try:
+            self.logger().info(f"🎯 BUY ${original_usd_amount} worth of {base_token} using {quote_token}")
 
-        for attempt in range(max_retries):
-            try:
-                self.logger().info(f"🎯 BUY ${original_usd_amount} worth of {base_token} using {quote_token}")
-
-                # Get base token price to calculate how much we want to receive
-                base_price = await self._get_solana_token_price(base_token, network)
-                if not base_price:
-                    self.logger().error(f"❌ Could not get {base_token} price")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(2)
-                        continue
-                    return False
-
-                # Calculate how much base token $1.50 gets us
-                base_amount_to_receive = original_usd_amount / float(base_price)
-
-                self.logger().info(
-                    f"💱 ${original_usd_amount} = {base_amount_to_receive:.6f} {base_token} @ ${base_price:.2f}")
-
-                # For logging: calculate approximate quote token needed
-                if quote_token not in ["USDC", "USDT"]:
-                    quote_price = await self._get_solana_token_price(quote_token, network)
-                    if quote_price:
-                        approx_quote_needed = original_usd_amount / float(quote_price)
-                        self.logger().info(f"📊 Will spend approximately {approx_quote_needed:.6f} {quote_token}")
-
-                # Build request - amount is the base token amount we want to receive
-                trade_request = {
-                    "network": network,
-                    "walletAddress": self.solana_wallet,
-                    "baseToken": base_token,  # RAY
-                    "quoteToken": quote_token,  # SOL
-                    "amount": base_amount_to_receive,  # How much RAY we want
-                    "side": "BUY",
-                    "slippagePct": self.slippage_tolerance
-                }
-
-                # Add pool based on type and exchange
-                if exchange.lower() == "jupiter":
-                    # Jupiter router doesn't use pool addresses - it finds optimal routes
-                    endpoint = "/connectors/jupiter/router/execute-swap"
-                    self.logger().info(f"📡 Jupiter Routing: {base_amount_to_receive:.6f} {base_token} with {quote_token}")
-                else:
-                    # Raydium, Meteora use pool addresses
-                    if pool_type == "clmm":
-                        trade_request["pool"] = pool_address
-                    else:
-                        trade_request["poolAddress"] = pool_address
-
-                    endpoint = f"/connectors/{exchange.lower()}/{pool_type}/execute-swap"
-                    self.logger().info(f"📡 Buying {base_amount_to_receive:.6f} {base_token} with {quote_token}")
-
-                response = await self.gateway_request("POST", endpoint, trade_request)
-
-                # Check for success (including timeout with signature)
-                if self._is_successful_response(response):
-                    signature = response.get("signature")
-                    if signature:
-                        self.logger().info(f"✅ Trade successful: {signature}")
-                        self.logger().info(f"🔗 https://solscan.io/tx/{signature}")
-
-                        # Log actual amounts if available
-                        if 'totalInputSwapped' in response and 'totalOutputSwapped' in response:
-                            self.logger().info(
-                                f"💰 Actual: {response['totalInputSwapped']} {quote_token} → "
-                                f"{response['totalOutputSwapped']} {base_token}"
-                            )
-
-                        # Track position
-                        self.active_positions[base_token] = {
-                            'quote_token': quote_token,
-                            'amount_bought': base_amount_to_receive,
-                            'usd_value': original_usd_amount,
-                            'pool': pool_address,
-                            'pool_type': pool_type,
-                            'network': network,
-                            'exchange': exchange,
-                            'timestamp': time.time(),
-                            'tx_signature': signature
-                        }
-
-                        self._last_trade_response = response
-                        return True
-
-                # Check if it's a timeout with signature
-                error_msg = str(response.get("message", response.get("error", ""))).lower()
-                if "timeout" in error_msg and "signature" in response:
-                    signature = response.get("signature")
-                    self.logger().warning(f"⚠️ Confirmation timeout, but transaction was sent: {signature}")
-
-                    # Verify if transaction actually succeeded
-                    if await self._verify_solana_transaction(signature, network, [base_token, quote_token]):
-                        self.logger().info(f"✅ Transaction verified successful despite timeout: {signature}")
-                        self.logger().info(f"🔗 https://solscan.io/tx/{signature}")
-
-                        # Track position
-                        self.active_positions[base_token] = {
-                            'quote_token': quote_token,
-                            'amount_bought': base_amount_to_receive,
-                            'usd_value': original_usd_amount,
-                            'pool': pool_address,
-                            'pool_type': pool_type,
-                            'network': network,
-                            'exchange': exchange,
-                            'timestamp': time.time(),
-                            'tx_signature': signature
-                        }
-                        return True
-
-                # Failed - retry if we have attempts left
-                if attempt < max_retries - 1:
-                    self.logger().warning(f"⚠️ Trade failed, retrying {attempt + 2}/{max_retries}...")
-                    await asyncio.sleep(3)
-                    continue
-
-                self.logger().error(f"❌ Trade failed after {max_retries} attempts: {response}")
+            # Get connector for this exchange
+            connector = self._get_dex_connector(exchange, pool_type)
+            if not connector:
+                self.logger().error(f"❌ No connector found for {exchange}/{pool_type}")
                 return False
 
-            except Exception as e:
-                self.logger().error(f"❌ Solana BUY error: {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2)
-                    continue
+            # Get base token price to calculate how much we want to receive
+            base_price = await self._get_solana_token_price(base_token, network)
+            if not base_price:
+                self.logger().error(f"❌ Could not get {base_token} price")
                 return False
 
-        return False
+            # Calculate how much base token we should receive
+            base_amount_to_receive = original_usd_amount / float(base_price)
+
+            self.logger().info(
+                f"💱 ${original_usd_amount} = {base_amount_to_receive:.6f} {base_token} @ ${base_price:.2f}")
+
+            # For logging: calculate approximate quote token needed
+            if quote_token not in ["USDC", "USDT"]:
+                quote_price = await self._get_solana_token_price(quote_token, network)
+                if quote_price:
+                    approx_quote_needed = original_usd_amount / float(quote_price)
+                    self.logger().info(f"📊 Will spend approximately {approx_quote_needed:.6f} {quote_token}")
+
+            # Build trading pair in format base-quote
+            trading_pair = f"{base_token}-{quote_token}"
+
+            # Use the price we got directly from the DEX (not connector.get_quote_price)
+            # This avoids the Coinbase rate oracle issue where RAY-USDC doesn't exist
+            # The connector will get the actual execution price from the DEX when placing the order
+            current_price = Decimal(str(base_price))
+            self.logger().info(f"📊 Using DEX price: ${current_price:.2f} (avoiding rate oracle)")
+
+            # Place order through connector
+            self.logger().info(f"📡 Placing order: BUY {base_amount_to_receive:.6f} {base_token} with {quote_token} on {exchange}/{pool_type}")
+
+            order_id = connector.place_order(
+                is_buy=True,
+                trading_pair=trading_pair,
+                amount=Decimal(str(base_amount_to_receive)),
+                price=current_price
+            )
+
+            self.logger().info(f"✅ Order placed with ID: {order_id} (awaiting execution)")
+
+            # Track this order for event handling
+            self._dex_order_tracking[order_id] = {
+                "signal_data": signal_data or {},
+                "exchange": exchange,
+                "pool_type": pool_type,
+                "trading_pair": trading_pair,
+                "base_token": base_token,
+                "quote_token": quote_token,
+                "network": network,
+                "pool_address": pool_address,
+                "usd_value": original_usd_amount,
+                "timestamp": time.time()
+            }
+
+            # Track position (preliminary - will be updated by did_fill_order event)
+            self.active_positions[base_token] = {
+                'quote_token': quote_token,
+                'amount_bought': base_amount_to_receive,
+                'usd_value': original_usd_amount,
+                'pool': pool_address,
+                'pool_type': pool_type,
+                'network': network,
+                'exchange': exchange,
+                'timestamp': time.time(),
+                'order_id': order_id,
+                'status': 'pending'
+            }
+
+            # Note: Order execution happens asynchronously
+            # The did_fill_order() event handler will be called when the trade completes
+            # MarketsRecorder will automatically persist to database
+            return True
+
+        except Exception as e:
+            self.logger().error(f"❌ Solana BUY error: {e}", exc_info=True)
+            return False
 
     async def _execute_sell_trade(self, symbol: str, percentage: Union[float, Decimal],
                                   network: str, exchange: str = "uniswap",
@@ -2233,900 +2342,481 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
             "network": network
         })
 
-    def _get_token_decimals(self, token: str, network: str) -> int:
-        """Get token decimals from loaded configuration"""
-        if network in self.token_decimals and token in self.token_decimals[network]:
-            return self.token_decimals[network][token]
-        # Fallback defaults
-        if token in ["USDC", "USDT"]:
-            return 6
-        elif token in ["WBTC", "cbBTC"]:
-            return 8
-        return 18  # Default for most ERC20 tokens
-
-    # Fix for WBTC buy - handles both USDC and WBTC decimal precision
-
     async def _execute_evm_buy_trade(self, base_token: str, network: str, exchange: str,
-                                     amount: float, pool: str = None) -> bool:
+                                     amount: float, pool: str = None, signal_data: dict = None) -> bool:
         """
-        Execute BUY trade on EVM networks - Gateway 2.9.0 compatible
-        PROVEN APPROACH: Selling USDC to acquire base_token
-        ADAPTIVE GAS: Always executes at current market gas price with max 3 retries
-        FIXED: Proper decimal handling for both input (USDC) and output (WBTC) tokens
+        Execute EVM BUY trade using connector framework (event-driven approach).
+        For BUY: We want to acquire $X worth of base_token using USDC
+
+        This method now uses connector.place_order() which:
+        - Triggers OrderFilledEvent when complete
+        - Automatically records to database via MarketsRecorder
+        - Handles retries and gas management internally
+
+        Args:
+            signal_data: Original signal data for tracking purposes
         """
-        max_retries = 3
+        try:
+            self.logger().info(f"🎯 BUY ${amount} worth of {base_token} using USDC on {network}")
 
-        for attempt in range(max_retries):
-            try:
-                wallet_address = self._get_wallet_for_network(network)
-                if not wallet_address:
-                    self.logger().error(f"❌ No wallet configured for network: {network}")
-                    return False
+            # Determine pool_type
+            pool_type = None
+            if pool and network in self.pool_configurations:
+                if exchange.lower() in self.pool_configurations[network]:
+                    connector_pools = self.pool_configurations[network][exchange.lower()]
+                    for p_type in ["clmm", "amm"]:
+                        if p_type in connector_pools and pool in connector_pools[p_type].values():
+                            pool_type = p_type
+                            break
 
-                # Determine DEX type: router vs pool-based
-                is_router_dex = exchange.lower() in ["0x", "jupiter"]
+            # Auto-detect router exchanges
+            if not pool_type and exchange.lower() in ["0x"]:
+                pool_type = "router"
 
-                if is_router_dex:
-                    # Router DEXs like 0x don't use pools - they aggregate across multiple sources
-                    pool_type = "router"
-                    self.logger().info(f"🌐 Using {exchange} router for optimal routing")
-                else:
-                    # Pool-based DEXs like Uniswap, Raydium
-                    pool_type = "clmm"
+            # Default to AMM for pool-based exchanges
+            if not pool_type:
+                pool_type = "amm"
 
-                    if pool and network in self.pool_configurations:
-                        if exchange.lower() in self.pool_configurations[network]:
-                            connector_pools = self.pool_configurations[network][exchange.lower()]
-                            for p_type in ["clmm", "amm"]:
-                                if p_type in connector_pools and pool in connector_pools[p_type].values():
-                                    pool_type = p_type
-                                    break
-
-                # Get USDC decimals
-                usdc_decimals = self._get_token_decimals("USDC", network)
-
-                # Get target token decimals (e.g., WBTC = 8)
-                target_token_decimals = self._get_token_decimals(base_token, network)
-                self.logger().debug(f"📊 Target token {base_token} has {target_token_decimals} decimals")
-
-                # IMPROVED: Better decimal handling for USDC amount
-
-
-                # Convert to Decimal for precise handling
-                trade_amount_decimal = Decimal(str(amount))
-
-                # Round to USDC precision
-                if usdc_decimals == 0:
-                    # No decimals - must be an integer
-                    trade_amount_decimal = trade_amount_decimal.quantize(Decimal('1'), rounding=ROUND_DOWN)
-                    trade_amount_str = str(int(trade_amount_decimal))
-                    trade_amount = float(trade_amount_str)
-                else:
-                    # Create precision with proper number of decimal places
-                    precision_str = '0.' + '0' * (usdc_decimals - 1) + '1'
-                    precision = Decimal(precision_str)
-                    trade_amount_decimal = trade_amount_decimal.quantize(precision, rounding=ROUND_DOWN)
-
-                    # CRITICAL FIX: Format to ensure no excess decimals
-                    # Use string formatting to control decimal places exactly
-                    trade_amount = round(float(trade_amount_decimal), usdc_decimals)
-
-                    # Ensure the float doesn't have floating point errors
-                    # Format with exact decimal places needed
-                    trade_amount_str = f"{trade_amount:.{usdc_decimals}f}"
-
-                    # Parse back to float to ensure clean value
-                    trade_amount = float(trade_amount_str)
-
-                # Ensure we have a valid amount
-                if trade_amount <= 0:
-                    self.logger().error(f"❌ Trade amount rounds to zero")
-                    return False
-
-                self.logger().debug(f"📊 Formatted USDC amount: {trade_amount} (decimals: {usdc_decimals})")
-
-                # CRITICAL FIX: Get a quote first to ensure proper decimal handling
-                if is_router_dex:
-                    # Router DEXs use /router/ prefix in endpoint structure
-                    quote_endpoint = f"/connectors/{exchange.lower()}/router/quote-swap"
-                else:
-                    # Pool-based DEXs use pool_type in path
-                    quote_endpoint = f"/connectors/{exchange.lower()}/{pool_type}/quote-swap"
-
-                # Initialize target_base_amount for all paths
-                target_base_amount = 0.0
-
-                # For 0x router, BUY operations need different logic than pool-based DEXs
-                # Experimental.  initial tests are failing
-                if is_router_dex:
-                    # 0x router: BUY WBTC means we want to buy WBTC using USDC
-                    # First get current price to calculate how much WBTC we can buy with our USD amount
-                    price_request = {
-                        "network": network,
-                        "baseToken": base_token,  # WBTC
-                        "quoteToken": "USDC",     # USDC
-                        "amount": "1",            # 1 unit of base token
-                        "side": "SELL",           # Price for selling 1 WBTC
-                        "indicativePrice": True   # Just price discovery
-                    }
-
-                    self.logger().info(f"🔍 Getting price for 1 {base_token} in USDC")
-                    price_response = await self.gateway_request("GET", quote_endpoint, params=price_request)
-
-                    if not price_response or "price" not in price_response:
-                        self.logger().error(f"❌ Could not get price for {base_token}")
-                        return False
-
-                    # Calculate how much base token we can buy with our USD amount
-                    base_token_price = float(price_response["price"])  # USDC per base_token
-                    target_base_amount = trade_amount / base_token_price
-
-                    # Round to appropriate precision for target token
-                    if target_token_decimals >= 8:
-                        max_precision = min(target_token_decimals, 8)
-                        target_base_amount = round(target_base_amount, max_precision)
-                    else:
-                        target_base_amount = round(target_base_amount, target_token_decimals)
-
-                    self.logger().info(f"🎯 Calculated target: {target_base_amount} {base_token} for ${trade_amount}")
-
-                    quote_request = {
-                        "network": network,
-                        "baseToken": base_token,     # What we're buying (WBTC)
-                        "quoteToken": "USDC",        # What we're paying with
-                        "amount": str(target_base_amount),  # Amount of base token to buy
-                        "side": "BUY"                # BUY operation
-                    }
-                else:
-                    # Pool-based DEXs (Uniswap): BUY WBTC = SELL USDC to get WBTC
-                    quote_request = {
-                        "network": network,
-                        "baseToken": "USDC",
-                        "quoteToken": base_token,
-                        "amount": str(trade_amount),  # Use string for quote
-                        "side": "SELL"  # We're selling USDC to get base_token
-                    }
-
-                if pool:
-                    quote_request["poolAddress"] = pool
-
-                self.logger().info(f"🔍 Getting price quote for {trade_amount} USDC → {base_token}")
-
-                # Get the quote
-                quote_response = await self.gateway_request("GET", quote_endpoint, params=quote_request)
-
-                expected_output = None
-                min_output = None
-
-                if quote_response and "amountOut" in quote_response:
-                    expected_output_raw = float(quote_response.get("amountOut", 0))
-
-                    # CRITICAL FIX: Format the expected output based on target token decimals
-                    if target_token_decimals >= 8:
-                        # Example: For high decimal tokens like WBTC (8 decimals), limit precision
-                        max_precision = min(target_token_decimals, 8)
-                        expected_output = round(expected_output_raw, max_precision)
-                    else:
-                        expected_output = round(expected_output_raw, target_token_decimals)
-
-                    # Calculate minimum output with slippage
-                    min_output = expected_output * (1 - self.slippage_tolerance / 100)
-
-                    # Format min_output to same precision
-                    if target_token_decimals >= 8:
-                        max_precision = min(target_token_decimals, 8)
-                        min_output = round(min_output, max_precision)
-                    else:
-                        min_output = round(min_output, target_token_decimals)
-
-                    self.logger().info(
-                        f"📊 Expected output: {expected_output:.8f} {base_token}, min: {min_output:.8f} {base_token}")
-                else:
-                    self.logger().warning(f"⚠️ Could not get quote, proceeding without min output")
-
-                # Build trade request based on DEX type
-                if is_router_dex:
-                    # 0x router: Use BUY logic with calculated target amount
-                    # my 0x is experimental and not working yet
-                    trade_request = {
-                        "network": network,
-                        "walletAddress": wallet_address,
-                        "baseToken": base_token,     # What we're buying (WBTC)
-                        "quoteToken": "USDC",        # What we're paying with
-                        "amount": target_base_amount,  # Amount of base token to buy
-                        "side": "BUY",               # BUY operation
-                        "slippagePct": self.slippage_tolerance
-                    }
-                else:
-                    # Pool-based DEXs: Use SELL logic (proven to work with uniswap: for a goal to BUY WBTC we Sell USDC to get WBTC)
-                    trade_request = {
-                        "network": network,
-                        "walletAddress": wallet_address,
-                        "baseToken": "USDC",  # SELLING USDC
-                        "quoteToken": base_token,  # TO GET base_token
-                        "amount": trade_amount,  # Amount of USDC to sell
-                        "side": "SELL",  # SELL side (proven to work)
-                        "slippagePct": self.slippage_tolerance
-                    }
-
-                # Add minimum output if we calculated it
-                if min_output and min_output > 0:
-                    # Format as string with appropriate precision
-                    if target_token_decimals >= 8:
-                        max_precision = min(target_token_decimals, 8)
-                        trade_request["minAmountOut"] = round(min_output, max_precision)
-                    else:
-                        trade_request["minAmountOut"] = round(min_output, target_token_decimals)
-
-                # ADAPTIVE GAS STRATEGY.  This address edge cases whee the gas price is to higher than expected and
-                # we have a failed trade.
-                if self.gas_strategy == "adaptive":
-                    # Always use current gas price with appropriate buffer
-                    if attempt == 0:
-                        # First attempt: use standard buffer for immediate execution
-                        gas_multiplier = self.gas_buffer
-                        self.logger().info(f"⛽ ADAPTIVE: Using current gas + {(gas_multiplier - 1) * 100:.0f}% buffer")
-                    else:
-                        # Retries: progressively increase to ensure execution
-                        gas_multiplier = self.gas_buffer + (self.gas_retry_multiplier * attempt)
-                        # For critical trades, use urgency multiplier
-                        if attempt >= 2:
-                            gas_multiplier = max(gas_multiplier, self.gas_urgency_multiplier)
-                        self.logger().warning(
-                            f"⛽ ADAPTIVE RETRY {attempt}: Using {(gas_multiplier - 1) * 100:.0f}% above current gas")
-
-                    trade_request["gasPriceMultiplier"] = gas_multiplier
-
-                if pool:
-                    trade_request["poolAddress"] = pool
-
-                endpoint = f"/connectors/{exchange.lower()}/{pool_type}/execute-swap"
-
-                #  Use the clean string for logging
-                self.logger().info(
-                    f"📤 EVM BUY: Swapping {trade_amount:.{usdc_decimals}f} USDC → {base_token} on {network}")
-
-                if expected_output:
-                    self.logger().info(f"💰 Expecting ~{expected_output:.8f} {base_token}")
-
-                response = await self.gateway_request("POST", endpoint, trade_request)
-                self._last_trade_response = response
-
-                if self._is_successful_response(response):
-                    tx_hash = self._extract_transaction_hash(response, network)
-                    if tx_hash:
-                        self.logger().info(f"✅ EVM BUY trade successful: {tx_hash}")
-
-                        # Log actual gas used if available
-                        if "gasUsed" in response and "gasPrice" in response:
-                            gas_used = response["gasUsed"]
-                            gas_price = response["gasPrice"]
-                            gas_cost_eth = (gas_used * gas_price) / 1e18
-                            gas_cost_gwei = gas_price / 1e9
-                            self.logger().info(f"⛽ Gas used: {gas_cost_eth:.6f} ETH @ {gas_cost_gwei:.2f} Gwei")
-
-                        explorer_url = self._get_blockchain_explorer_url(tx_hash, network)
-                        self.logger().info(f"🔗 Transaction: {explorer_url}")
-
-                        self.active_positions[base_token] = {
-                            'quote_token': 'USDC',
-                            'amount_spent': trade_amount,
-                            'pool': pool,
-                            'pool_type': pool_type,
-                            'network': network,
-                            'timestamp': time.time()
-                        }
-                    return True
-
-                # ERROR HANDLING WITH RETRIES
-                error_msg = str(response.get("message", response.get("error", ""))).lower()
-
-                if "max fee per gas less than block base fee" in error_msg or "gas price" in error_msg:
-                    if attempt < max_retries - 1:
-                        # Extract actual required gas from error
-                        import re
-                        base_fee_match = re.search(r'baseFee:\s*(\d+)', error_msg)
-                        max_fee_match = re.search(r'maxFeePerGas:\s*(\d+)', error_msg)
-
-                        if base_fee_match:
-                            base_fee = int(base_fee_match.group(1))
-                            base_fee_gwei = base_fee / 1e9
-                            self.logger().warning(f"📊 Current base fee: {base_fee_gwei:.2f} Gwei")
-
-                            if max_fee_match:
-                                our_fee = int(max_fee_match.group(1))
-                                our_fee_gwei = our_fee / 1e9
-                                deficit_pct = ((base_fee - our_fee) / our_fee) * 100
-                                self.logger().warning(
-                                    f"📊 Our offer: {our_fee_gwei:.2f} Gwei (deficit: {deficit_pct:.1f}%)")
-
-                        self.logger().warning(f"⚠️ Gas too low - switching to ADAPTIVE mode for retry")
-                        # Force adaptive strategy for retry
-                        self.gas_strategy = "adaptive"
-                        await asyncio.sleep(1)  # Short wait
-                        continue
-                    else:
-                        self.logger().error(f"❌ Unable to match required gas price after {max_retries} attempts")
-                        return False
-
-                elif "fractional component exceeds decimals" in error_msg:
-                    self.logger().error(f"❌ Decimal precision error")
-                    self.logger().debug(f"Attempted amount: {trade_amount}, USDC decimals: {usdc_decimals}")
-                    self.logger().debug(
-                        f"Expected output: {expected_output}, {base_token} decimals: {target_token_decimals}")
-
-                    # Try without minAmountOut on retry
-                    if attempt < max_retries - 1:
-                        self.logger().warning(f"⚠️ Retrying without minimum output constraint...")
-                        min_output = None  # Disable minimum output for retry
-                        await asyncio.sleep(1)
-                        continue
-
-                    return False
-
-                elif "transaction failed" in error_msg or "call_exception" in error_msg:
-                    self.logger().error(f"❌ Transaction reverted - likely slippage or liquidity issue")
-                    if attempt < max_retries - 1:
-                        self.logger().info(f"⏳ Waiting before retry {attempt + 2}/{max_retries}...")
-                        await asyncio.sleep(3)
-                        continue
-                    return False
-
-                else:
-
-                    self.logger().error(f"❌ EVM BUY trade failed: {response}")
-                    return False
-
-            except Exception as e:
-                self.logger().error(f"❌ EVM BUY trade error: {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2)
-                    continue
+            # Get connector for this exchange (network-specific for EVM)
+            connector = self._get_dex_connector(exchange, pool_type, network)
+            if not connector:
+                self.logger().error(f"❌ No connector found for {exchange}/{pool_type}/{network}")
                 return False
 
-        return False
+            quote_token = "USDC"
+
+            # Build trading pair in format base-quote (e.g., "WBTC-USDC", "WETH-USDC")
+            trading_pair = f"{base_token}-{quote_token}"
+
+            # Get base token price from the DEX directly (not from connector.get_quote_price)
+            # This avoids the Coinbase rate oracle issue where WBTC-USDC doesn't exist on Coinbase
+            try:
+                base_price = await self._get_token_price_in_usd(base_token, network, exchange, pool_type)
+                if not base_price:
+                    self.logger().error(f"❌ Could not get {base_token} price from DEX")
+                    return False
+
+                # Calculate how much base token we can buy with our USD budget
+                base_amount_to_receive = Decimal(str(amount)) / Decimal(str(base_price))
+
+                # Use the DEX price directly (avoiding rate oracle)
+                current_price = Decimal(str(base_price))
+
+                self.logger().info(
+                    f"💱 ${amount} ≈ {base_amount_to_receive:.6f} {base_token} @ ${current_price:.2f} per {base_token}")
+                self.logger().info(f"📊 Using DEX price: ${current_price:.2f} (avoiding rate oracle)")
+
+            except Exception as e:
+                self.logger().error(f"❌ Could not calculate trade amounts: {e}", exc_info=True)
+                return False
+
+            # Place order through connector
+            # IMPORTANT: For EVM pool-based DEXs, we need to invert the operation
+            # To BUY WBTC, we actually SELL USDC to get WBTC (proven pattern from API method)
+            self.logger().info(f"📡 Placing order: BUY {base_amount_to_receive:.6f} {base_token} with USDC on {exchange}/{pool_type}")
+
+            # For EVM: Invert to SELL USDC to get base_token
+            inverted_pair = f"{quote_token}-{base_token}"  # "USDC-WBTC" instead of "WBTC-USDC"
+            usdc_amount_to_sell = Decimal(str(amount))  # Amount of USDC to sell
+
+            self.logger().info(f"🔄 EVM Inversion: SELL {usdc_amount_to_sell:.2f} {quote_token} → {base_token}")
+
+            order_id = connector.place_order(
+                is_buy=False,  # SELL operation (selling USDC)
+                trading_pair=inverted_pair,  # USDC-WBTC
+                amount=usdc_amount_to_sell,  # Amount of USDC to sell
+                price=Decimal("1") / current_price  # Inverted price (USDC per WBTC)
+            )
+
+            self.logger().info(f"✅ Order placed with ID: {order_id} (awaiting execution)")
+
+            # Track this order for event handling
+            self._dex_order_tracking[order_id] = {
+                "signal_data": signal_data or {},
+                "exchange": exchange,
+                "pool_type": pool_type,
+                "trading_pair": trading_pair,
+                "base_token": base_token,
+                "quote_token": quote_token,
+                "network": network,
+                "pool_address": pool or "",
+                "usd_value": amount,
+                "timestamp": time.time()
+            }
+
+            # Track position (preliminary - will be updated by did_fill_order event)
+            self.active_positions[base_token] = {
+                'quote_token': quote_token,
+                'amount_bought': float(base_amount_to_receive),
+                'usd_value': amount,
+                'pool': pool,
+                'pool_type': pool_type,
+                'network': network,
+                'exchange': exchange,
+                'timestamp': time.time(),
+                'order_id': order_id,
+                'status': 'pending'
+            }
+
+            # Note: Order execution happens asynchronously
+            # The did_fill_order() event handler will be called when the trade completes
+            # MarketsRecorder will automatically persist to database
+            return True
+
+        except Exception as e:
+            self.logger().error(f"❌ EVM BUY error: {e}", exc_info=True)
+            return False
 
     # Fix for WETH (and other 18-decimal tokens) sell precision error
 
     async def _execute_evm_sell_trade(self, base_token: str, network: str, exchange: str, percentage: float,
-                                      pool: str = None) -> bool:
+                                      pool: str = None, signal_data: dict = None) -> bool:
         """
-        Execute SELL trade on EVM networks - Gateway 2.9.0 compatible
-        FIXED: Proper decimal handling for high-precision tokens like WETH (18 decimals)
-        ADAPTIVE GAS: Always executes at current market gas price with max 3 retries
+        Execute SELL trade on EVM networks using connector framework.
+        For EVM SELL: We invert to BUY USDC-WBTC (buying USDC with WBTC)
+
+        This method uses connector.place_order() which:
+        - Triggers OrderFilledEvent when complete
+        - Automatically records to database via MarketsRecorder
+        - Handles transaction submission and monitoring
+
+        Args:
+            signal_data: Original signal data for tracking purposes
         """
-        max_retries = 3
+        try:
+            # Step 1: Determine pool and quote token from position
+            position = self.active_positions.get(base_token, {})
 
-        for attempt in range(max_retries):
-            try:
-                balance_response = await self._get_token_balance(base_token, network)
+            if position:
+                # Use tracked position info
+                quote_token = position.get("quote_token", "USDC")
+                pool_type = position.get("pool_type", "clmm")
 
-                if balance_response is None or balance_response <= 0:
-                    self.logger().warning(f"⚠️ No {base_token} balance available to sell")
-                    return False
+                if not pool and position.get("pool"):
+                    pool = position["pool"]
+                    self.logger().info(f"📝 Using pool from BUY position: {pool[:10] if pool else 'auto'}...")
 
-                # Get token decimals from configuration
-                token_decimals = self._get_token_decimals(base_token, network)
+                self.logger().info(f"📝 Closing position: {base_token} → {quote_token} ({pool_type})")
+            else:
+                # No position tracked - determine pool info
+                self.logger().info(f"⚠️ No position tracked for {base_token}, detecting pool configuration")
 
-                # Calculate sell amount
-                sell_amount_raw = float(balance_response) * (percentage / 100.0)
+                quote_token = "USDC"
+                pool_type = None
 
-                # Convert to Decimal for precise handling
-                sell_amount_decimal = Decimal(str(sell_amount_raw))
+                # If pool address provided, get its info
+                if pool:
+                    pool_info = await self._get_pool_info(network, exchange, pool_address=pool)
+                    if pool_info:
+                        pool_type = pool_info['type']
+                        if pool_info.get('quote_token'):
+                            quote_token = pool_info['quote_token']
+                        self.logger().info(f"📋 Found pool config: {pool_type} pool for {quote_token}")
 
-                # SPECIAL HANDLING FOR HIGH DECIMAL TOKENS
-                if token_decimals >= 8:  # For tokens with 8+ decimals
-                    # Limit precision to prevent Gateway/ethers.js overflow
-                    # Most DEXs don't need more than 8-10 decimal precision anyway
-                    max_precision = 10  # Use at most 10 decimal places
-
-                    # Create precision string with limited decimals
-                    actual_precision = min(token_decimals, max_precision)
-                    precision_str = '0.' + '0' * (actual_precision - 1) + '1'
-                    precision = Decimal(precision_str)
-                    sell_amount_decimal = sell_amount_decimal.quantize(precision, rounding=ROUND_DOWN)
-
-                    # Clean conversion to float
-                    sell_amount = float(sell_amount_decimal)
-
-                    # Additional safety: ensure we don't have floating point artifacts
-                    sell_amount_str = f"{sell_amount:.{actual_precision}f}"
-                    # Remove trailing zeros to keep it clean
-                    sell_amount_str = sell_amount_str.rstrip('0').rstrip('.')
-                    sell_amount = float(sell_amount_str)
-
-                    self.logger().debug(
-                        f"📊 High-precision token {base_token}: {sell_amount} (limited to {actual_precision} decimals)")
-
-                elif token_decimals == 0:
-                    # Integer tokens (no decimals)
-                    sell_amount_decimal = sell_amount_decimal.quantize(Decimal('1'), rounding=ROUND_DOWN)
-                    sell_amount = float(int(sell_amount_decimal))
+                # If no pool provided, find one
                 else:
-                    # Low decimal tokens (1-7 decimals)
-                    precision_str = '0.' + '0' * (token_decimals - 1) + '1'
-                    precision = Decimal(precision_str)
-                    sell_amount_decimal = sell_amount_decimal.quantize(precision, rounding=ROUND_DOWN)
-                    sell_amount = round(float(sell_amount_decimal), token_decimals)
-
-                if sell_amount <= 0:
-                    self.logger().error(f"❌ Calculated sell amount is zero")
-                    return False
-
-                self.logger().debug(
-                    f"📊 Formatted {base_token} amount: {sell_amount} (token decimals: {token_decimals})")
-
-                wallet_address = self._get_wallet_for_network(network)
-                if not wallet_address:
-                    self.logger().error(f"❌ No wallet configured for network: {network}")
-                    return False
-
-                # Determine DEX type: router vs pool-based
-                is_router_dex = exchange.lower() in ["0x", "jupiter"]
-
-                if is_router_dex:
-                    # Router DEXs like 0x don't use pools - they aggregate across multiple sources
-                    pool_type = "router"
-                    self.logger().info(f"🌐 Using {exchange} router for optimal routing")
-                else:
-                    # Pool-based DEXs like Uniswap, Raydium
-                    pool_type = "clmm"
-                    if base_token in self.active_positions:
-                        position = self.active_positions[base_token]
-                        if position.get('network') == network and position.get('pool_type'):
-                            pool_type = position['pool_type']
-                            if not pool and position.get('pool'):
-                                pool = position['pool']
-                    elif pool and network in self.pool_configurations:
-                        if exchange.lower() in self.pool_configurations[network]:
-                            connector_pools = self.pool_configurations[network][exchange.lower()]
-                            for p_type in ["clmm", "amm"]:
-                                if p_type in connector_pools and pool in connector_pools[p_type].values():
-                                    pool_type = p_type
-                                    break
-
-                # Get a price quote first to calculate proper minimum output
-                if is_router_dex:
-                    # Router DEXs use /router/ prefix in endpoint structure
-                    quote_endpoint = f"/connectors/{exchange.lower()}/router/quote-swap"
-                else:
-                    # Pool-based DEXs use pool_type in path
-                    quote_endpoint = f"/connectors/{exchange.lower()}/{pool_type}/quote-swap"
-
-                quote_request = {
-                    "network": network,
-                    "baseToken": base_token,
-                    "quoteToken": "USDC",
-                    "amount": str(sell_amount),  # Use string for quote
-                    "side": "SELL"
-                }
-
-                # Only add pool address for pool-based DEXs
-                if pool and not is_router_dex:
-                    quote_request["poolAddress"] = pool
-
-                self.logger().info(f"🔍 Getting price quote for {sell_amount} {base_token}")
-
-                # Get the quote first
-                quote_response = await self.gateway_request("GET", quote_endpoint, params=quote_request)
-
-                expected_output = None
-                min_output = None
-
-                if quote_response and "amountOut" in quote_response:
-                    expected_output = float(quote_response.get("amountOut", 0))
-                    # Apply slippage tolerance to get minimum acceptable output
-                    min_output = expected_output * (1 - self.slippage_tolerance / 100)
-                    self.logger().info(f"📊 Expected output: {expected_output:.6f} USDC, min: {min_output:.6f} USDC")
-                else:
-                    self.logger().warning(f"⚠️ Could not get quote, using default slippage")
-                    # Fallback: Let Gateway handle it
-                    min_output = 0
-
-                # Build the actual trade request
-                trade_request = {
-                    "network": network,
-                    "walletAddress": wallet_address,
-                    "baseToken": base_token,
-                    "quoteToken": "USDC",
-                    "amount": sell_amount,  # Now properly formatted with limited precision
-                    "side": "SELL",
-                    "slippagePct": self.slippage_tolerance
-                }
-
-                # CRITICAL: Add minimum output if we calculated it
-                if min_output and min_output > 0:
-                    trade_request["minAmountOut"] = min_output
-
-                # ADAPTIVE GAS STRATEGY
-                if self.gas_strategy == "adaptive":
-                    # Always use current gas price with appropriate buffer
-                    if attempt == 0:
-                        # First attempt: use standard buffer for immediate execution
-                        gas_multiplier = self.gas_buffer
-                        self.logger().info(f"⛽ ADAPTIVE: Using current gas + {(gas_multiplier - 1) * 100:.0f}% buffer")
+                    if exchange and exchange.lower() == "0x":
+                        pool_type = "router"
+                        pool = None
+                        self.logger().info(f"📋 0x router detected - no pool address needed")
                     else:
-                        # Retries: progressively increase to ensure execution
-                        gas_multiplier = self.gas_buffer + (self.gas_retry_multiplier * attempt)
-                        # For critical trades, use urgency multiplier
-                        if attempt >= 2:
-                            gas_multiplier = max(gas_multiplier, self.gas_urgency_multiplier)
-                        self.logger().warning(
-                            f"⛽ ADAPTIVE RETRY {attempt}: Using {(gas_multiplier - 1) * 100:.0f}% above current gas")
+                        pool_key = f"{base_token}-{quote_token}"
+                        pool_info = await self._get_pool_info(network, exchange, pool_key=pool_key)
 
-                    trade_request["gasPriceMultiplier"] = gas_multiplier
-
-                # Only add pool address for pool-based DEXs
-                if pool and not is_router_dex:
-                    trade_request["poolAddress"] = pool
-
-                # Use appropriate endpoint based on DEX type
-                if is_router_dex:
-                    endpoint = f"/connectors/{exchange.lower()}/router/execute-swap"
-                else:
-                    endpoint = f"/connectors/{exchange.lower()}/{pool_type}/execute-swap"
-
-                # Log with appropriate precision for display
-                display_precision = min(token_decimals, 10)
-                self.logger().info(
-                    f"📤 EVM SELL: Selling {sell_amount:.{display_precision}f} {base_token} → USDC on {network}")
-
-                if expected_output:
-                    self.logger().info(f"💰 Expecting ~{expected_output:.2f} USDC (min: {min_output:.2f})")
-
-                response = await self.gateway_request("POST", endpoint, trade_request)
-                self._last_trade_response = response
-
-                if self._is_successful_response(response):
-                    tx_hash = self._extract_transaction_hash(response, network)
-                    if tx_hash:
-                        self.logger().info(f"✅ EVM SELL trade successful: {tx_hash}")
-
-                        # Log actual gas used if available
-                        if "gasUsed" in response and "gasPrice" in response:
-                            gas_used = response["gasUsed"]
-                            gas_price = response["gasPrice"]
-                            gas_cost_eth = (gas_used * gas_price) / 1e18
-                            gas_cost_gwei = gas_price / 1e9
-                            self.logger().info(f"⛽ Gas used: {gas_cost_eth:.6f} ETH @ {gas_cost_gwei:.2f} Gwei")
-
-                        explorer_url = self._get_blockchain_explorer_url(tx_hash, network)
-                        self.logger().info(f"🔗 Transaction: {explorer_url}")
-
-                    if base_token in self.active_positions:
-                        del self.active_positions[base_token]
-
-                    return True
-
-                # ERROR HANDLING
-                error_msg = str(response.get("message", response.get("error", ""))).lower()
-
-                if "max fee per gas less than block base fee" in error_msg or "gas price" in error_msg:
-                    if attempt < max_retries - 1:
-                        # Extract actual required gas from error
-
-                        base_fee_match = re.search(r'baseFee:\s*(\d+)', error_msg)
-                        max_fee_match = re.search(r'maxFeePerGas:\s*(\d+)', error_msg)
-
-                        if base_fee_match:
-                            base_fee = int(base_fee_match.group(1))
-                            base_fee_gwei = base_fee / 1e9
-                            self.logger().warning(f"📊 Current base fee: {base_fee_gwei:.2f} Gwei")
-
-                            if max_fee_match:
-                                our_fee = int(max_fee_match.group(1))
-                                our_fee_gwei = our_fee / 1e9
-                                deficit_pct = ((base_fee - our_fee) / our_fee) * 100
-                                self.logger().warning(
-                                    f"📊 Our offer: {our_fee_gwei:.2f} Gwei (deficit: {deficit_pct:.1f}%)")
-
-                        self.logger().warning(f"⚠️ Gas too low - switching to ADAPTIVE mode for retry")
-                        # Force adaptive strategy for retry
-                        self.gas_strategy = "adaptive"
-                        await asyncio.sleep(1)  # Short wait
-                        continue
-                    else:
-                        self.logger().error(f"❌ Unable to match required gas price after {max_retries} attempts")
-                        return False
-
-                elif "fractional component exceeds decimals" in error_msg:
-                    self.logger().error(f"❌ Decimal precision error for {base_token}")
-                    self.logger().debug(f"Attempted amount: {sell_amount}, decimals: {token_decimals}")
-
-                    # If we still get this error, try with even less precision
-                    if token_decimals >= 8 and attempt < max_retries - 1:
-                        self.logger().warning(f"⚠️ Retrying with reduced precision...")
-                        # Force even lower precision on retry
-                        max_precision = 8  # Reduce to 8 decimals max
-                        await asyncio.sleep(1)
-                        continue
-
-                    return False
-
-                elif "transaction failed" in error_msg or "call_exception" in error_msg:
-                    self.logger().error(f"❌ Transaction reverted - likely slippage or price movement")
-                    if attempt < max_retries - 1:
-                        self.logger().info(f"⏳ Waiting before retry {attempt + 2}/{max_retries}...")
-                        await asyncio.sleep(3)
-                        continue
-                    return False
-
-                else:
-                    self.logger().error(f"❌ EVM SELL trade failed: {response}")
-                    return False
-
-            except Exception as e:
-                self.logger().error(f"❌ EVM SELL trade error: {e}")
-                self.logger().debug(f"Traceback: {traceback.format_exc()}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2)
-                    continue
-                return False
-
-        return False
-
-    async def _execute_solana_sell_trade(self, base_token: str, network: str, exchange: str,
-                                         percentage: float, pool: str = None) -> bool:
-        """
-        Execute SELL trade on Solana - Gateway 2.9 simplified version
-        Uses unified _get_pool_info method
-        WITH RETRY LOGIC: Matches EVM trade retry behavior
-        """
-        max_retries = 3
-
-        for attempt in range(max_retries):
-            try:
-                # Step 1: Determine pool and quote token
-                position = self.active_positions.get(base_token, {})
-
-                if position:
-                    # Use tracked position info
-                    quote_token = position.get("quote_token", "USDC")
-                    pool_type = position.get("pool_type", "amm")
-
-                    if not pool and position.get("pool"):
-                        pool = position["pool"]
-                        self.logger().info(f"📝 Using pool from BUY position: {pool[:10]}...")
-
-                    self.logger().info(f"📝 Closing position: {base_token} → {quote_token} ({pool_type})")
-
-                else:
-                    # No position tracked - determine pool info
-                    self.logger().info(f"⚠️ No position tracked for {base_token}, detecting pool configuration")
-
-                    # Default quote token
-                    quote_token = "USDC"
-                    pool_type = None
-
-                    # If pool address provided, get its info
-                    if pool:
-                        pool_info = await self._get_pool_info(network, exchange, pool_address=pool)
                         if pool_info:
+                            pool = pool_info['address']
                             pool_type = pool_info['type']
-                            # Use discovered quote token if available
                             if pool_info.get('quote_token'):
                                 quote_token = pool_info['quote_token']
-                            self.logger().info(f"📋 Found pool config: {pool_type} pool for {quote_token}")
 
-                    # If no pool provided, find one
-                    else:
-                        # Special handling for Jupiter - it's a router and doesn't need pool lookup
-                        if exchange and exchange.lower() == "jupiter":
-                            pool_type = "router"
-                            pool = None
-                            self.logger().info(
-                                f"📋 Jupiter router detected - no pool address needed for {base_token}-{quote_token}")
-                        else:
-                            pool_key = f"{base_token}-{quote_token}"
-                            pool_info = await self._get_pool_info(network, exchange, pool_key=pool_key)
-
-                            if pool_info:
-                                pool = pool_info['address']
-                                pool_type = pool_info['type']
-                                if pool_info.get('quote_token'):
-                                    quote_token = pool_info['quote_token']
-
-                                # Handle router-based exchanges (Jupiter) that don't use pool addresses
-                                if pool_type == 'router' or pool is None:
-                                    self.logger().info(
-                                        f"📋 Found {pool_type} configuration for {base_token}-{quote_token}")
-                                else:
-                                    self.logger().info(f"📋 Found {pool_type} pool: {pool[:10]}...")
+                            if pool_type == 'router' or pool is None:
+                                self.logger().info(f"📋 Found {pool_type} configuration for {base_token}-{quote_token}")
                             else:
-                                # pool_info is None - handle gracefully
-                                self.logger().warning(
-                                    f"⚠️ No pool configuration found for {base_token}-{quote_token} on {exchange}")
-                                pool = None
-                                pool_type = None
-
-                    # Final fallback for pool type
-                    if not pool_type:
-                        # CRITICAL FIX: On Solana, default to AMM for most trading pairs
-                        pool_type = "amm"
-                        self.logger().info(f"📋 Using default AMM for Solana trading")
-
-                # Step 2: Get balance with guaranteed initialization
-                balance = await self._get_token_balance(base_token, network)
-
-                # Ensure balance is always a number, never None
-                if balance is None:
-                    balance = 0
-
-                if not balance or balance <= 0:
-                    # Retry with direct Gateway call
-                    self.logger().info(f"⚠️ Retrying balance check with direct Gateway call")
-
-                    wallet_address = self._get_wallet_for_network(network)
-                    balance_request = {
-                        "network": network,
-                        "address": wallet_address,
-                        "tokens": [base_token]
-                    }
-
-                    response = await self.gateway_request("POST", "/chains/solana/balances", balance_request)
-
-                    if response and "balances" in response and response["balances"] is not None:
-                        balances_dict = response["balances"]
-                        if isinstance(balances_dict, dict):
-                            balance = float(balances_dict.get(base_token, 0))
+                                self.logger().info(f"📋 Found {pool_type} pool: {pool[:10]}...")
                         else:
-                            self.logger().warning(f"⚠️ Balances response is not a dict: {type(balances_dict)}")
-                            balance = 0
-                    else:
-                        # If Gateway response is None or invalid, set balance to 0
-                        self.logger().warning(f"⚠️ Gateway balance response invalid for {base_token}")
-                        balance = 0
+                            self.logger().warning(f"⚠️ No pool configuration found for {base_token}-{quote_token} on {exchange}")
+                            pool = None
+                            pool_type = None
 
-                    # FIXED: This if statement now has proper indentation
-                    if not balance or balance <= 0:
-                        self.logger().warning(f"⚠️ No {base_token} balance to sell")
-                        self.active_positions.pop(base_token, None)
-                        # Continue to next retry attempt instead of returning
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(2)
-                            continue
-                        return False
+                # Final fallback for pool type
+                if not pool_type:
+                    pool_type = "clmm"
+                    self.logger().info(f"📋 Using default CLMM for EVM trading")
 
-                # Step 3: Calculate sell amount with SOL minimum balance protection
-                sell_amount = float(balance) * (percentage / 100.0)
+            # Auto-detect pool type for router exchanges
+            if exchange.lower() in ['0x']:
+                pool_type = 'router'
 
-                # SOL minimum balance protection for gas fees
-                if base_token == "SOL" and quote_token in ["USDC", "USDT"]:
-                    if sell_amount > (float(balance) - self.min_sol_balance):
-                        original_sell_amount = sell_amount
-                        sell_amount = max(0.0, float(balance) - self.min_sol_balance)
-                        self.logger().info(
-                            f"🛡️ SOL minimum balance protection: Reducing sell from {original_sell_amount:.6f} to {sell_amount:.6f} "
-                            f"to preserve {self.min_sol_balance} SOL for gas fees"
-                        )
+            # Default to CLMM for pool-based exchanges
+            if not pool_type:
+                pool_type = "clmm"
 
-                        if sell_amount <= 0:
-                            self.logger().warning(
-                                f"⚠️ Cannot sell SOL: Would leave less than minimum balance of {self.min_sol_balance} SOL for gas fees"
-                            )
-                            return False
+            # Step 2: Get balance
+            balance = await self._get_token_balance(base_token, network)
 
-                self.logger().info(f"💰 Selling {sell_amount:.6f} {base_token} ({percentage}% of {balance:.6f})")
+            if balance is None:
+                balance = 0
 
-                # Step 4: Build trade request
-                wallet_address = self._get_wallet_for_network(network)
-
-                trade_request = {
-                    "network": network,
-                    "walletAddress": wallet_address,
-                    "baseToken": base_token,
-                    "quoteToken": quote_token,
-                    "amount": sell_amount,
-                    "side": "SELL",
-                    "slippagePct": self.slippage_tolerance
-                }
-
-                # Add pool parameter based on type and exchange
-                if exchange.lower() == "jupiter":
-                    # Jupiter router doesn't use pool addresses - it finds optimal routes
-                    endpoint = "/connectors/jupiter/router/execute-swap"
-                    self.logger().info(f"📡 Jupiter Routing: {sell_amount:.6f} {base_token} → {quote_token}")
-                else:
-                    # Raydium, Meteora use pool addresses
-                    if pool_type == "clmm":
-                        if pool:
-                            trade_request["pool"] = pool
-                        endpoint = f"/connectors/{exchange.lower()}/clmm/execute-swap"
-                    else:  # AMM
-                        if pool:
-                            trade_request["poolAddress"] = pool
-                        endpoint = f"/connectors/{exchange.lower()}/amm/execute-swap"
-
-                # Step 5: Execute trade
-                self.logger().info(f"📤 SELL: {sell_amount:.6f} {base_token} → {quote_token}")
-
-                # CRITICAL FIX: For CLMM pools on Solana, handle slippage differently
-                if pool_type == "clmm" and self._is_solana_network(network):
-                    # Get quote to calculate minimum output with slippage
-                    quote_endpoint = f"/connectors/{exchange.lower()}/clmm/quote-swap"
-                    quote_params = {
-                        "network": network,
-                        "baseToken": base_token,
-                        "quoteToken": quote_token,
-                        "amount": str(sell_amount),
-                        "side": "SELL"
-                    }
-                    if pool:
-                        quote_params["pool"] = pool
-
-                    quote_response = await self.gateway_request("GET", quote_endpoint, params=quote_params)
-
-                    if quote_response and "amountOut" in quote_response:
-                        expected_output = float(quote_response.get("amountOut", 0))
-                        # Apply slippage tolerance
-                        min_output = expected_output * (1 - self.slippage_tolerance / 100)
-                        trade_request["minAmountOut"] = min_output
-                        self.logger().info(
-                            f"📊 Expected output: {expected_output:.6f} {quote_token}, min: {min_output:.6f}")
-
-                self.logger().debug(f"📋 Request to {endpoint}: {json.dumps(trade_request, indent=2)}")
-
-                response = await self.gateway_request("POST", endpoint, trade_request)
-                self._last_trade_response = response
-
-                # Step 6: Handle response
-                if self._is_successful_response(response) and "signature" in response:
-                    signature = response["signature"]
-
-                    self.logger().info(f"✅ SELL successful: {signature}")
-                    self.logger().info(f"🔗 https://solscan.io/tx/{signature}")
-
-                    # Log actual swap amounts
-                    if "totalInputSwapped" in response and "totalOutputSwapped" in response:
-                        self.logger().info(
-                            f"💰 Swapped: {response['totalInputSwapped']} {base_token} → "
-                            f"{response['totalOutputSwapped']} {quote_token}"
-                        )
-
-                    # Clean up position tracking
-                    self.active_positions.pop(base_token, None)
-                    self.logger().info(f"📝 Position closed: {base_token}")
-
-                    return True
-
-                # Check if it's a timeout with signature
-                error_msg = str(response.get("message", response.get("error", ""))).lower()
-                if "timeout" in error_msg and "signature" in response:
-                    signature = response.get("signature")
-                    self.logger().warning(f"⚠️ Confirmation timeout, but transaction was sent: {signature}")
-
-                    # Verify if transaction actually succeeded
-                    if await self._verify_solana_transaction(signature, network, [base_token, quote_token]):
-                        self.logger().info(f"✅ Transaction verified successful despite timeout: {signature}")
-                        self.logger().info(f"🔗 https://solscan.io/tx/{signature}")
-
-                        # Clean up position tracking
-                        self.active_positions.pop(base_token, None)
-                        self.logger().info(f"📝 Position closed after verification: {base_token}")
-                        return True
-
-                # Failed - retry if we have attempts left
-                if attempt < max_retries - 1:
-                    self.logger().warning(f"⚠️ Trade failed, retrying {attempt + 2}/{max_retries}...")
-                    await asyncio.sleep(3)
-                    continue
-
-                self.logger().error(f"❌ Trade failed after {max_retries} attempts: {response}")
+            if not balance or balance <= 0:
+                self.logger().warning(f"⚠️ No {base_token} balance to sell")
+                self.active_positions.pop(base_token, None)
                 return False
+
+            # Step 3: Calculate sell amount
+            sell_amount = Decimal(str(float(balance) * (percentage / 100.0)))
+
+            self.logger().info(f"💰 Selling {sell_amount:.6f} {base_token} ({percentage}% of {balance:.6f})")
+
+            # Step 4: Get network-specific connector
+            connector = self._get_dex_connector(exchange, pool_type, network)
+            if not connector:
+                self.logger().error(f"❌ No connector found for {exchange}/{pool_type}/{network}")
+                return False
+
+            # Get current price from DEX (not from connector.get_quote_price to avoid rate oracle issue)
+            try:
+                base_price = await self._get_token_price_in_usd(base_token, network, exchange, pool_type)
+                if not base_price:
+                    self.logger().error(f"❌ Could not get {base_token} price from DEX")
+                    return False
+
+                # Calculate expected USDC output
+                expected_usdc = sell_amount * Decimal(str(base_price))
+
+                # Use the DEX price directly (avoiding rate oracle)
+                current_price = Decimal(str(base_price))
+
+                self.logger().info(
+                    f"💱 {sell_amount:.6f} {base_token} ≈ ${expected_usdc:.2f} USDC @ ${current_price:.2f} per {base_token}")
+                self.logger().info(f"📊 Using DEX price: ${current_price:.2f} (avoiding rate oracle)")
 
             except Exception as e:
-                self.logger().error(f"❌ Solana SELL error: {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2)
-                    continue
+                self.logger().error(f"❌ Could not calculate trade amounts: {e}", exc_info=True)
                 return False
 
-        return False
+            # Place order through connector
+            # IMPORTANT: For EVM pool-based DEXs, we need to invert the operation
+            # To SELL WBTC, we actually BUY USDC with WBTC (inverted from buy logic)
+            self.logger().info(f"📡 Placing order: SELL {sell_amount:.6f} {base_token} for USDC on {exchange}/{pool_type}")
+
+            # For EVM: Invert to SELL WBTC-USDC (selling WBTC for USDC)
+            # Actually, we should NOT invert for sell! We should do a normal SELL operation.
+            trading_pair = f"{base_token}-{quote_token}"  # "WBTC-USDC"
+
+            self.logger().info(f"📡 Direct SELL: {sell_amount:.6f} {base_token} for {quote_token}")
+
+            order_id = connector.place_order(
+                is_buy=False,  # SELL operation (selling WBTC for USDC)
+                trading_pair=trading_pair,  # WBTC-USDC
+                amount=sell_amount,  # Amount of WBTC to sell
+                price=current_price  # Price in USDC per WBTC
+            )
+
+            self.logger().info(f"✅ Order placed with ID: {order_id} (awaiting execution)")
+
+            # Track this order for event handling
+            self._dex_order_tracking[order_id] = {
+                "signal_data": signal_data or {},
+                "exchange": exchange,
+                "pool_type": pool_type,
+                "trading_pair": trading_pair,
+                "base_token": base_token,
+                "quote_token": quote_token,
+                "network": network,
+                "pool_address": pool or "",
+                "usd_value": float(expected_usdc),
+                "timestamp": time.time(),
+                "is_sell": True
+            }
+
+            # Mark position for removal (will be deleted by did_fill_order event)
+            if base_token in self.active_positions:
+                self.active_positions[base_token]['status'] = 'closing'
+
+            return True
+
+        except Exception as e:
+            self.logger().error(f"❌ EVM SELL trade error: {e}")
+            self.logger().debug(f"Traceback: {traceback.format_exc()}")
+            return False
+
+    async def _execute_solana_sell_trade(self, base_token: str, network: str, exchange: str,
+                                         percentage: float, pool: str = None, signal_data: dict = None) -> bool:
+        """
+        Execute Solana SELL trade using connector framework (event-driven approach).
+        For SELL: We want to sell X% of our base_token holdings for quote_token
+
+        This method now uses connector.place_order() which:
+        - Triggers OrderFilledEvent when complete
+        - Automatically records to database via MarketsRecorder
+        - Handles retries and timeouts internally
+
+        Args:
+            signal_data: Original signal data for tracking purposes
+        """
+        try:
+            # Step 1: Determine pool and quote token from position
+            position = self.active_positions.get(base_token, {})
+
+            if position:
+                # Use tracked position info
+                quote_token = position.get("quote_token", "USDC")
+                pool_type = position.get("pool_type", "amm")
+
+                if not pool and position.get("pool"):
+                    pool = position["pool"]
+                    self.logger().info(f"📝 Using pool from BUY position: {pool[:10] if pool else 'router'}...")
+
+                self.logger().info(f"📝 Closing position: {base_token} → {quote_token} ({pool_type})")
+
+            else:
+                # No position tracked - determine pool info
+                self.logger().info(f"⚠️ No position tracked for {base_token}, detecting pool configuration")
+
+                quote_token = "USDC"
+                pool_type = None
+
+                # If pool address provided, get its info
+                if pool:
+                    pool_info = await self._get_pool_info(network, exchange, pool_address=pool)
+                    if pool_info:
+                        pool_type = pool_info['type']
+                        if pool_info.get('quote_token'):
+                            quote_token = pool_info['quote_token']
+                        self.logger().info(f"📋 Found pool config: {pool_type} pool for {quote_token}")
+
+                # If no pool provided, find one
+                else:
+                    if exchange and exchange.lower() == "jupiter":
+                        pool_type = "router"
+                        pool = None
+                        self.logger().info(f"📋 Jupiter router detected - no pool address needed")
+                    else:
+                        pool_key = f"{base_token}-{quote_token}"
+                        pool_info = await self._get_pool_info(network, exchange, pool_key=pool_key)
+
+                        if pool_info:
+                            pool = pool_info['address']
+                            pool_type = pool_info['type']
+                            if pool_info.get('quote_token'):
+                                quote_token = pool_info['quote_token']
+
+                            if pool_type == 'router' or pool is None:
+                                self.logger().info(f"📋 Found {pool_type} configuration for {base_token}-{quote_token}")
+                            else:
+                                self.logger().info(f"📋 Found {pool_type} pool: {pool[:10]}...")
+                        else:
+                            self.logger().warning(f"⚠️ No pool configuration found for {base_token}-{quote_token} on {exchange}")
+                            pool = None
+                            pool_type = None
+
+                # Final fallback for pool type
+                if not pool_type:
+                    pool_type = "amm"
+                    self.logger().info(f"📋 Using default AMM for Solana trading")
+
+            # Step 2: Get balance
+            balance = await self._get_token_balance(base_token, network)
+
+            if balance is None:
+                balance = 0
+
+            if not balance or balance <= 0:
+                self.logger().warning(f"⚠️ No {base_token} balance to sell")
+                self.active_positions.pop(base_token, None)
+                return False
+
+            # Step 3: Calculate sell amount with SOL minimum balance protection
+            sell_amount = float(balance) * (percentage / 100.0)
+
+            # SOL minimum balance protection for gas fees
+            if base_token == "SOL" and quote_token in ["USDC", "USDT"]:
+                if sell_amount > (float(balance) - self.min_sol_balance):
+                    original_sell_amount = sell_amount
+                    sell_amount = max(0.0, float(balance) - self.min_sol_balance)
+                    self.logger().info(
+                        f"🛡️ SOL minimum balance protection: Reducing sell from {original_sell_amount:.6f} to {sell_amount:.6f} "
+                        f"to preserve {self.min_sol_balance} SOL for gas fees"
+                    )
+
+                    if sell_amount <= 0:
+                        self.logger().warning(
+                            f"⚠️ Cannot sell SOL: Would leave less than minimum balance of {self.min_sol_balance} SOL for gas fees"
+                        )
+                        return False
+
+            self.logger().info(f"💰 Selling {sell_amount:.6f} {base_token} ({percentage}% of {balance:.6f})")
+
+            # Step 4: Get connector
+            connector = self._get_dex_connector(exchange, pool_type)
+            if not connector:
+                self.logger().error(f"❌ No connector found for {exchange}/{pool_type}")
+                return False
+
+            # Step 5: Build trading pair in format base-quote
+            trading_pair = f"{base_token}-{quote_token}"
+
+            # Get current price from DEX (not from connector.get_quote_price to avoid rate oracle issue)
+            try:
+                base_price = await self._get_solana_token_price(base_token, network)
+                if not base_price:
+                    self.logger().error(f"❌ Could not get {base_token} price from DEX")
+                    return False
+
+                current_price = Decimal(str(base_price))
+                expected_quote_amount = Decimal(str(sell_amount)) * current_price
+
+                self.logger().info(
+                    f"💱 {sell_amount:.6f} {base_token} @ ${current_price:.2f} ≈ {expected_quote_amount:.6f} {quote_token}")
+                self.logger().info(f"📊 Using DEX price: ${current_price:.2f} (avoiding rate oracle)")
+
+            except Exception as e:
+                self.logger().error(f"❌ Could not calculate trade amounts: {e}", exc_info=True)
+                return False
+
+            # Step 6: Place order through connector
+            self.logger().info(f"📡 Placing order: SELL {sell_amount:.6f} {base_token} for {quote_token} on {exchange}/{pool_type}")
+
+            order_id = connector.place_order(
+                is_buy=False,  # SELL order
+                trading_pair=trading_pair,
+                amount=Decimal(str(sell_amount)),
+                price=current_price
+            )
+
+            self.logger().info(f"✅ Order placed with ID: {order_id} (awaiting execution)")
+
+            # Track this order for event handling
+            self._dex_order_tracking[order_id] = {
+                "signal_data": signal_data or {},
+                "exchange": exchange,
+                "pool_type": pool_type,
+                "trading_pair": trading_pair,
+                "base_token": base_token,
+                "quote_token": quote_token,
+                "network": network,
+                "pool_address": pool or "",
+                "timestamp": time.time()
+            }
+
+            # Note: Order execution happens asynchronously
+            # The did_fill_order() event handler will be called when the trade completes
+            # MarketsRecorder will automatically persist to database
+            # Position cleanup will happen in did_fill_order()
+            return True
+
+        except Exception as e:
+            self.logger().error(f"❌ Solana SELL error: {e}", exc_info=True)
+            return False
 
     def _parse_symbol_tokens(self, symbol: str, network: str) -> tuple:
-        """Parse trading symbol into base and quote tokens - unchanged"""
+        """
+        Parse trading symbol into base and quote tokens
+        Handles token normalization for cross-chain compatibility (e.g., BTC → WBTC on EVM)
+        """
         symbol_upper = symbol.upper()
 
+        # Solana-specific parsing
         if network == "mainnet-beta":
             known_tokens = ['SOL', 'USDC', 'USDT', 'RAY', 'PEPE', 'WIF', 'POPCAT',
                            'TRUMP', 'LAYER', 'JITOSOL', 'BONK', 'FARTCOIN']
@@ -3146,24 +2836,106 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                 if len(parts) == 2 and parts[1] in ['C', 'T']:
                     return parts[0], 'USD' + parts[1]
 
+        # Generic parsing for all chains
         for quote in ['USDC', 'USDT', 'USD', 'DAI', 'ETH', 'WETH']:
             if symbol_upper.endswith(quote):
                 base = symbol_upper[:-len(quote)]
                 if base:
+                    # Apply token normalization for EVM chains
+                    base = self._normalize_token_symbol(base, network)
                     return base, quote
 
+        # Handle hyphenated format (e.g., "BTC-USDC")
         if '-' in symbol:
             parts = symbol.split('-')
             if len(parts) == 2:
-                return parts[0].upper(), parts[1].upper()
+                base = parts[0].upper()
+                quote = parts[1].upper()
+                # Apply token normalization for EVM chains
+                base = self._normalize_token_symbol(base, network)
+                return base, quote
 
         self.logger().warning(f"⚠️ Could not parse {symbol}, defaulting to {symbol}-USDC")
         return symbol.upper(), 'USDC'
 
-    async def _get_token_price_in_usd(self, token: str, network: str, exchange: str = "raydium") -> Optional[Decimal]:
+    def _normalize_token_symbol(self, token: str, network: str) -> str:
         """
-        Get token price in USD from Gateway
-        FIXED: Use quote-swap endpoint for all Raydium price queries with proper params
+        Normalize token symbols for cross-chain compatibility
+
+        Args:
+            token: The token symbol to normalize (e.g., "BTC", "ETH")
+            network: The network name (e.g., "arbitrum", "mainnet", "optimism")
+
+        Returns:
+            Normalized token symbol (e.g., "BTC" → "WBTC" on EVM chains)
+        """
+        # EVM chain detection
+        evm_chains = ['arbitrum', 'mainnet', 'ethereum', 'optimism', 'base', 'polygon',
+                     'avalanche', 'bsc', 'celo', 'sepolia']
+
+        if network.lower() in evm_chains:
+            # Map native/unwrapped tokens to their wrapped equivalents
+            token_mapping = {
+                'BTC': 'WBTC',   # Bitcoin → Wrapped Bitcoin
+                'SOL': 'WSOL',   # Solana → Wrapped Solana (if bridged)
+            }
+
+            normalized = token_mapping.get(token.upper(), token.upper())
+            if normalized != token.upper():
+                self.logger().debug(f"🔄 Normalized {token} → {normalized} for {network}")
+            return normalized
+
+        # For non-EVM chains (like Solana), return as-is
+        return token.upper()
+
+    async def _get_token_price_in_usd(self, token: str, network: str, exchange: str = "raydium", pool_type: str = None) -> Optional[Decimal]:
+        """
+        Get token price in USD from Gateway with retry logic for transient errors
+        FIXED: Use quote-swap endpoint with proper pool_type for all exchanges
+
+        Args:
+            token: The token to get price for
+            network: The network (e.g., arbitrum, mainnet-beta)
+            exchange: The exchange (e.g., uniswap, raydium)
+            pool_type: The pool type (clmm, amm, router) - required for proper endpoint routing
+        """
+        max_retries = 3
+        retry_delay = 1  # seconds
+
+        for attempt in range(max_retries):
+            try:
+                return await self._fetch_token_price_internal(token, network, exchange, pool_type)
+            except Exception as e:
+                error_msg = str(e)
+
+                # Check for transient division by zero error (likely RPC/cache issue on liquid pools)
+                if "Division by zero" in error_msg or "division by zero" in error_msg.lower():
+                    if attempt < max_retries - 1:
+                        self.logger().warning(
+                            f"⚠️ Transient error for {token} pool (attempt {attempt + 1}/{max_retries}): Division by zero - retrying in {retry_delay}s..."
+                        )
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                        continue
+                    else:
+                        # All retries exhausted
+                        self.logger().error(
+                            f"❌ Pool for {token} still showing zero liquidity after {max_retries} attempts - likely actual liquidity issue"
+                        )
+                        self.logger().warning(f"⚠️ Skipping trade for {token} due to persistent zero liquidity")
+                        return None
+
+                # For other errors, fail immediately
+                self.logger().error(f"❌ Error fetching {token} price: {e}")
+                fallback = self._get_fallback_price(token)
+                self.logger().warning(f"⚠️ Using fallback price ${fallback:.2f} due to error")
+                return fallback
+
+        return None
+
+    async def _fetch_token_price_internal(self, token: str, network: str, exchange: str = "raydium", pool_type: str = None) -> Optional[Decimal]:
+        """
+        Internal method to fetch token price (called by _get_token_price_in_usd with retry logic)
         """
         try:
             # For Raydium on Solana, always use quote-swap endpoint
@@ -3248,10 +3020,16 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                 response = await self.gateway_request("GET", endpoint, params=price_params)
 
             else:
-                # For other networks/exchanges (EVM), check if we should use GET or POST
+                # For other networks/exchanges (EVM), use proper pool_type routing
                 if exchange in ["uniswap", "pancakeswap"]:
-                    # EVM exchanges might use GET for quote-swap
-                    endpoint = f"/connectors/{exchange}/quote-swap"
+                    # Determine pool_type if not provided
+                    if not pool_type:
+                        # Default to clmm for modern DEXs, fallback to amm
+                        pool_type = "clmm"
+                        self.logger().debug(f"🔍 No pool_type provided, defaulting to {pool_type}")
+
+                    # Use correct endpoint format with pool_type: /connectors/{exchange}/{pool_type}/quote-swap
+                    endpoint = f"/connectors/{exchange}/{pool_type}/quote-swap"
                     price_params = {
                         "network": network,
                         "baseToken": token,
@@ -3259,7 +3037,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                         "amount": "1",
                         "side": "SELL"
                     }
-                    self.logger().info(f"🔍 Fetching {token} price from {exchange} on {network}...")
+                    self.logger().info(f"🔍 Fetching {token} price from {exchange} {pool_type.upper()} on {network}...")
                     response = await self.gateway_request("GET", endpoint, params=price_params)
                 else:
                     # Fallback to POST for price endpoint (if it exists)
@@ -3297,6 +3075,13 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
             return None
 
         except Exception as e:
+            error_msg = str(e)
+            # Check for division by zero error from Gateway (indicates zero liquidity pool)
+            if "Division by zero" in error_msg or "division by zero" in error_msg.lower():
+                self.logger().error(f"❌ Pool for {token} has ZERO LIQUIDITY - cannot execute trade")
+                self.logger().warning(f"⚠️ Skipping trade for {token} due to zero liquidity pool")
+                return None  # Return None to prevent trade execution with invalid pool
+
             self.logger().error(f"❌ Error fetching {token} price: {e}")
             fallback = self._get_fallback_price(token)
             self.logger().warning(f"⚠️ Using fallback price ${fallback:.2f} due to error")
