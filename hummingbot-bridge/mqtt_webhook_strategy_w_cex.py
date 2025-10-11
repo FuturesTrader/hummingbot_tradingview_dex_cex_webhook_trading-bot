@@ -6,7 +6,6 @@ GATEWAY 2.9.0
 - Simplified flat structure for pools
 - Updated API endpoints with /chains/ prefix
 - Pool type explicitly specified in routes
-
 Author: Todd Griggs
 Date: Sept 19, 2025
 
@@ -15,6 +14,7 @@ import time
 import datetime
 import traceback
 import pandas as pd
+
 import json
 import os
 import ssl
@@ -230,6 +230,43 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
         else:
             self.logger().info(f"⛽ Gas Strategy: FIXED (buffer={self.gas_buffer}x)")
 
+        # Transaction failure tracking and retry configuration
+        self.failed_orders: Dict[str, Dict[str, Any]] = {}  # order_id -> failure details
+        self.retry_attempts: Dict[str, int] = {}  # order_id -> retry count
+        self.max_retry_attempts: int = int(os.getenv("HBOT_MAX_RETRY_ATTEMPTS", "3"))
+        self.retry_delay_base: float = float(os.getenv("HBOT_RETRY_DELAY_BASE", "2.0"))  # seconds
+        self.order_timeout: int = int(os.getenv("HBOT_ORDER_TIMEOUT", "120"))  # seconds
+
+        # Gas-related error tracking
+        self.gas_errors: List[Dict[str, Any]] = []
+        self.gas_error_count: int = 0
+        self.last_gas_error_time: Optional[float] = None
+
+        # Order status monitoring
+        self.pending_orders: Dict[str, Dict[str, Any]] = {}  # order_id -> {timestamp, details}
+
+        # Gas price monitoring and alerting
+        self.gas_price_history: List[Dict[str, Any]] = []  # Historical gas prices
+        self.gas_price_warning_threshold: float = float(os.getenv("HBOT_GAS_WARNING_GWEI", "1.0"))  # Gwei
+        self.gas_price_critical_threshold: float = float(os.getenv("HBOT_GAS_CRITICAL_GWEI", "2.0"))  # Gwei
+        self.last_gas_alert_time: Optional[float] = None
+        self.gas_alert_cooldown: int = int(os.getenv("HBOT_GAS_ALERT_COOLDOWN", "300"))  # seconds
+
+        # Network-specific gas thresholds (Gwei)
+        self.network_gas_thresholds: Dict[str, Dict[str, float]] = {
+            'arbitrum': {'warning': 0.5, 'critical': 1.0},
+            'ethereum': {'warning': 30.0, 'critical': 50.0},
+            'base': {'warning': 0.5, 'critical': 1.0},
+            'optimism': {'warning': 0.5, 'critical': 1.0},
+            'polygon': {'warning': 50.0, 'critical': 100.0},
+            'bsc': {'warning': 3.0, 'critical': 5.0},
+            'avalanche': {'warning': 25.0, 'critical': 40.0},
+            'celo': {'warning': 0.5, 'critical': 1.0}
+        }
+
+        self.logger().info(f"🔄 Retry configuration: max_attempts={self.max_retry_attempts}, base_delay={self.retry_delay_base}s, order_timeout={self.order_timeout}s")
+        self.logger().info(f"⛽ Gas monitoring: warning={self.gas_price_warning_threshold} GWEI, critical={self.gas_price_critical_threshold} GWEI, alert_cooldown={self.gas_alert_cooldown}s")
+
     @classmethod
     def init_markets(cls, config=None):
         """
@@ -314,6 +351,33 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
             signal_data = order_info.get("signal_data", {})
             base_token = order_info.get("base_token")
             trading_pair = event.trading_pair
+
+            # Record gas price for EVM transactions (if available)
+            try:
+                connector = self._get_dex_connector(exchange, pool_type)
+                if connector and hasattr(connector, 'in_flight_orders'):
+                    # Get the in-flight order to extract gas price
+                    in_flight_order = connector.in_flight_orders.get(event.order_id)
+                    if in_flight_order and hasattr(in_flight_order, 'gas_price'):
+                        gas_price_wei = float(in_flight_order.gas_price)
+                        if gas_price_wei > 0:
+                            # Convert from Wei to Gwei (1 Gwei = 1e9 Wei)
+                            gas_price_gwei = gas_price_wei / 1e9
+
+                            # Determine network from exchange name
+                            network = exchange.lower() if exchange else 'unknown'
+
+                            # Record gas price for monitoring
+                            self._record_gas_price(
+                                gas_price_gwei=gas_price_gwei,
+                                network=network,
+                                tx_hash=event.exchange_trade_id,
+                                symbol=trading_pair,
+                                action=event.trade_type.name
+                            )
+            except Exception as gas_err:
+                # Don't fail the order handler if gas recording fails
+                self.logger().debug(f"⚠️ Could not record gas price: {gas_err}")
 
             # Build log message
             log_msg = (
@@ -467,10 +531,237 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                 safe_ensure_future(self._refresh_configuration())
                 self._last_config_refresh = current_time
 
+            # Monitor pending orders for timeouts (check every tick)
+            self._check_pending_order_timeouts(current_time)
 
+            # Monitor gas prices (check every tick, alerts with cooldown)
+            self._monitor_gas_prices(current_time)
+
+            # Clean up old gas errors (keep last hour only)
+            if self.gas_errors:
+                one_hour_ago = current_time - 3600
+                self.gas_errors = [err for err in self.gas_errors if err.get('timestamp', 0) > one_hour_ago]
+
+            # Clean up old gas price history (keep last 24 hours)
+            if self.gas_price_history:
+                one_day_ago = current_time - 86400
+                self.gas_price_history = [
+                    entry for entry in self.gas_price_history
+                    if entry.get('timestamp', 0) > one_day_ago
+                ]
 
         except Exception as maintenance_error:
             self.logger().debug(f"⚠️ Maintenance error (non-critical): {maintenance_error}")
+
+    def _check_pending_order_timeouts(self, current_time: float):
+        """
+        Check for pending orders that have exceeded timeout threshold
+        Log warnings and clean up stale orders
+        """
+        try:
+            if not self.pending_orders:
+                return
+
+            timed_out_orders = []
+
+            for order_id, order_info in self.pending_orders.items():
+                order_timestamp = order_info.get('timestamp', current_time)
+                time_elapsed = current_time - order_timestamp
+
+                if time_elapsed > self.order_timeout:
+                    timed_out_orders.append(order_id)
+
+                    # Log timeout warning
+                    order_details = order_info.get('details', {})
+                    symbol = order_details.get('symbol', 'UNKNOWN')
+                    action = order_details.get('action', 'UNKNOWN')
+                    network = order_details.get('network', 'UNKNOWN')
+
+                    self.logger().warning(
+                        f"⏰ Order timeout detected: {order_id}\n"
+                        f"   Action: {action} {symbol} on {network}\n"
+                        f"   Time elapsed: {time_elapsed:.1f}s (timeout: {self.order_timeout}s)"
+                    )
+
+                    # Track gas errors if this appears to be a gas-related timeout
+                    if 'gas' in str(order_info.get('error', '')).lower():
+                        self.gas_error_count += 1
+                        self.last_gas_error_time = current_time
+                        self.gas_errors.append({
+                            'timestamp': current_time,
+                            'order_id': order_id,
+                            'details': order_details,
+                            'error': order_info.get('error', 'Timeout')
+                        })
+
+            # Clean up timed out orders
+            for order_id in timed_out_orders:
+                del self.pending_orders[order_id]
+
+            if timed_out_orders:
+                self.logger().info(f"🧹 Cleaned up {len(timed_out_orders)} timed out orders")
+
+        except Exception as e:
+            self.logger().debug(f"⚠️ Error checking order timeouts: {e}")
+
+    def _monitor_gas_prices(self, current_time: float):
+        """
+        Monitor gas prices from recent transactions and alert on anomalies
+        Tracks gas price history and detects unusually high gas prices
+        """
+        try:
+            # Skip if no gas price history to analyze
+            if not self.gas_price_history:
+                return
+
+            # Clean up old gas price entries (keep last 24 hours)
+            one_day_ago = current_time - 86400
+            self.gas_price_history = [
+                entry for entry in self.gas_price_history
+                if entry.get('timestamp', 0) > one_day_ago
+            ]
+
+            # Get recent gas prices (last hour)
+            one_hour_ago = current_time - 3600
+            recent_prices = [
+                entry for entry in self.gas_price_history
+                if entry.get('timestamp', 0) > one_hour_ago
+            ]
+
+            if not recent_prices:
+                return
+
+            # Calculate statistics
+            gas_prices_gwei = [entry['gas_price_gwei'] for entry in recent_prices if 'gas_price_gwei' in entry]
+
+            if not gas_prices_gwei:
+                return
+
+            avg_gas = sum(gas_prices_gwei) / len(gas_prices_gwei)
+            max_gas = max(gas_prices_gwei)
+            min_gas = min(gas_prices_gwei)
+
+            # Get latest gas price
+            latest_entry = recent_prices[-1]
+            latest_gas = latest_entry.get('gas_price_gwei', 0)
+            network = latest_entry.get('network', 'unknown')
+
+            # Get network-specific thresholds
+            thresholds = self.network_gas_thresholds.get(
+                network,
+                {'warning': self.gas_price_warning_threshold, 'critical': self.gas_price_critical_threshold}
+            )
+
+            warning_threshold = thresholds['warning']
+            critical_threshold = thresholds['critical']
+
+            # Check for alerts (with cooldown to avoid spam)
+            should_alert = False
+            alert_level = None
+
+            if latest_gas >= critical_threshold:
+                alert_level = 'CRITICAL'
+                should_alert = True
+            elif latest_gas >= warning_threshold:
+                alert_level = 'WARNING'
+                should_alert = True
+
+            # Apply alert cooldown
+            if should_alert:
+                if self.last_gas_alert_time is None or (current_time - self.last_gas_alert_time) >= self.gas_alert_cooldown:
+                    self.last_gas_alert_time = current_time
+
+                    # Generate alert message
+                    self.logger().warning(
+                        f"⛽ GAS PRICE {alert_level}: {network.upper()}\n"
+                        f"   Current: {latest_gas:.4f} GWEI\n"
+                        f"   Average (1h): {avg_gas:.4f} GWEI\n"
+                        f"   Range (1h): {min_gas:.4f} - {max_gas:.4f} GWEI\n"
+                        f"   Threshold: {warning_threshold:.4f} GWEI (warning), {critical_threshold:.4f} GWEI (critical)"
+                    )
+
+                    # Log recent transaction context
+                    tx_hash = latest_entry.get('tx_hash', 'N/A')
+                    symbol = latest_entry.get('symbol', 'N/A')
+                    action = latest_entry.get('action', 'N/A')
+
+                    if tx_hash != 'N/A':
+                        explorer_url = self._get_blockchain_explorer_url(tx_hash, network)
+                        self.logger().info(
+                            f"   Transaction: {action} {symbol}\n"
+                            f"   Explorer: {explorer_url}"
+                        )
+
+            # Periodic status update (every 5 minutes if we have data)
+            if not hasattr(self, '_last_gas_status_log'):
+                self._last_gas_status_log = current_time
+
+            if current_time - self._last_gas_status_log > 300:  # 5 minutes
+                self._last_gas_status_log = current_time
+
+                # Log summary of recent gas prices by network
+                networks_summary = {}
+                for entry in recent_prices:
+                    net = entry.get('network', 'unknown')
+                    gas_gwei = entry.get('gas_price_gwei', 0)
+
+                    if net not in networks_summary:
+                        networks_summary[net] = []
+                    networks_summary[net].append(gas_gwei)
+
+                if networks_summary:
+                    self.logger().info("⛽ Gas Price Summary (Last Hour):")
+                    for net, prices in networks_summary.items():
+                        net_avg = sum(prices) / len(prices)
+                        net_max = max(prices)
+                        net_thresholds = self.network_gas_thresholds.get(
+                            net,
+                            {'warning': self.gas_price_warning_threshold, 'critical': self.gas_price_critical_threshold}
+                        )
+
+                        status_icon = "✅"
+                        if net_avg >= net_thresholds['critical']:
+                            status_icon = "🔴"
+                        elif net_avg >= net_thresholds['warning']:
+                            status_icon = "⚠️"
+
+                        self.logger().info(
+                            f"   {status_icon} {net}: Avg {net_avg:.4f} GWEI, Max {net_max:.4f} GWEI "
+                            f"(threshold: {net_thresholds['warning']:.4f}/{net_thresholds['critical']:.4f})"
+                        )
+
+        except Exception as e:
+            self.logger().debug(f"⚠️ Error monitoring gas prices: {e}")
+
+    def _record_gas_price(self, gas_price_gwei: float, network: str, tx_hash: str = None,
+                         symbol: str = None, action: str = None):
+        """
+        Record a gas price from a transaction for monitoring
+
+        Args:
+            gas_price_gwei: Gas price in Gwei
+            network: Network name (e.g., 'arbitrum', 'ethereum')
+            tx_hash: Transaction hash (optional)
+            symbol: Trading symbol (optional)
+            action: Trade action (BUY/SELL) (optional)
+        """
+        try:
+            self.gas_price_history.append({
+                'timestamp': time.time(),
+                'gas_price_gwei': gas_price_gwei,
+                'network': network,
+                'tx_hash': tx_hash,
+                'symbol': symbol,
+                'action': action
+            })
+
+            self.logger().debug(
+                f"📊 Recorded gas price: {gas_price_gwei:.4f} GWEI on {network} "
+                f"({'(' + action + ' ' + symbol + ')' if action and symbol else ''})"
+            )
+
+        except Exception as e:
+            self.logger().debug(f"⚠️ Error recording gas price: {e}")
 
     async def _refresh_configuration(self):
         """Refresh Gateway configuration periodically"""
@@ -2220,6 +2511,19 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                 "timestamp": time.time()
             }
 
+            # Track pending order for timeout monitoring
+            self.pending_orders[order_id] = {
+                'timestamp': time.time(),
+                'details': {
+                    'symbol': trading_pair,
+                    'action': 'BUY',
+                    'network': network,
+                    'exchange': exchange,
+                    'pool_type': pool_type,
+                    'usd_value': original_usd_amount
+                }
+            }
+
             # Track position (preliminary - will be updated by did_fill_order event)
             self.active_positions[base_token] = {
                 'quote_token': quote_token,
@@ -2399,11 +2703,23 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                 # Calculate how much base token we can buy with our USD budget
                 base_amount_to_receive = Decimal(str(amount)) / Decimal(str(base_price))
 
+                # Quantize to appropriate decimal places based on token
+                # WBTC has 8 decimals, most tokens have 18, USDC has 6
+                if base_token in ['WBTC', 'BTC']:
+                    # Bitcoin-based tokens: 8 decimals
+                    base_amount_to_receive = base_amount_to_receive.quantize(Decimal('0.00000001'))
+                elif base_token in ['USDC', 'USDT', 'DAI']:
+                    # Stablecoins: 6 decimals
+                    base_amount_to_receive = base_amount_to_receive.quantize(Decimal('0.000001'))
+                else:
+                    # Most ERC20 tokens: 18 decimals
+                    base_amount_to_receive = base_amount_to_receive.quantize(Decimal('0.000000000000000001'))
+
                 # Use the DEX price directly (avoiding rate oracle)
                 current_price = Decimal(str(base_price))
 
                 self.logger().info(
-                    f"💱 ${amount} ≈ {base_amount_to_receive:.6f} {base_token} @ ${current_price:.2f} per {base_token}")
+                    f"💱 ${amount} ≈ {base_amount_to_receive:.8f} {base_token} @ ${current_price:.2f} per {base_token}")
                 self.logger().info(f"📊 Using DEX price: ${current_price:.2f} (avoiding rate oracle)")
 
             except Exception as e:
@@ -2411,21 +2727,17 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                 return False
 
             # Place order through connector
-            # IMPORTANT: For EVM pool-based DEXs, we need to invert the operation
-            # To BUY WBTC, we actually SELL USDC to get WBTC (proven pattern from API method)
-            self.logger().info(f"📡 Placing order: BUY {base_amount_to_receive:.6f} {base_token} with USDC on {exchange}/{pool_type}")
-
-            # For EVM: Invert to SELL USDC to get base_token
-            inverted_pair = f"{quote_token}-{base_token}"  # "USDC-WBTC" instead of "WBTC-USDC"
-            usdc_amount_to_sell = Decimal(str(amount))  # Amount of USDC to sell
-
-            self.logger().info(f"🔄 EVM Inversion: SELL {usdc_amount_to_sell:.2f} {quote_token} → {base_token}")
+            # Gateway BUY expects the amount of base token (WBTC) we want to receive
+            self.logger().info(
+                f"📡 Placing order: BUY {base_amount_to_receive:.8f} {base_token} "
+                f"(≈ ${amount} USDC) on {exchange}/{pool_type}"
+            )
 
             order_id = connector.place_order(
-                is_buy=False,  # SELL operation (selling USDC)
-                trading_pair=inverted_pair,  # USDC-WBTC
-                amount=usdc_amount_to_sell,  # Amount of USDC to sell
-                price=Decimal("1") / current_price  # Inverted price (USDC per WBTC)
+                is_buy=True,  # BUY operation (buying WBTC with USDC)
+                trading_pair=trading_pair,  # WBTC-USDC (natural order)
+                amount=base_amount_to_receive,  # Amount of WBTC we want to receive
+                price=current_price  # Price in USDC per WBTC
             )
 
             self.logger().info(f"✅ Order placed with ID: {order_id} (awaiting execution)")
@@ -2442,6 +2754,19 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                 "pool_address": pool or "",
                 "usd_value": amount,
                 "timestamp": time.time()
+            }
+
+            # Track pending order for timeout monitoring
+            self.pending_orders[order_id] = {
+                'timestamp': time.time(),
+                'details': {
+                    'symbol': trading_pair,
+                    'action': 'BUY',
+                    'network': network,
+                    'exchange': exchange,
+                    'pool_type': pool_type,
+                    'usd_value': amount
+                }
             }
 
             # Track position (preliminary - will be updated by did_fill_order event)
@@ -2595,15 +2920,11 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                 return False
 
             # Place order through connector
-            # IMPORTANT: For EVM pool-based DEXs, we need to invert the operation
-            # To SELL WBTC, we actually BUY USDC with WBTC (inverted from buy logic)
+            # Gateway connector handles the swap direction internally via the is_buy parameter
+            # We just need to provide the trading pair in the natural format (BASE-QUOTE)
             self.logger().info(f"📡 Placing order: SELL {sell_amount:.6f} {base_token} for USDC on {exchange}/{pool_type}")
 
-            # For EVM: Invert to SELL WBTC-USDC (selling WBTC for USDC)
-            # Actually, we should NOT invert for sell! We should do a normal SELL operation.
             trading_pair = f"{base_token}-{quote_token}"  # "WBTC-USDC"
-
-            self.logger().info(f"📡 Direct SELL: {sell_amount:.6f} {base_token} for {quote_token}")
 
             order_id = connector.place_order(
                 is_buy=False,  # SELL operation (selling WBTC for USDC)

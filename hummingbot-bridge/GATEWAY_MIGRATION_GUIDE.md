@@ -190,7 +190,126 @@ def _execute_with_network_override(self, operation):
 
 ---
 
-## 5. Potential Breaking Changes to Watch For
+## 5. Critical Gateway Bug Fix (2025-10-11)
+
+### Bug: "fractional component exceeds decimals" Error on All EVM Trades
+
+**Symptoms**:
+- All EVM network trades (Arbitrum, Base, Optimism, etc.) fail with error:
+  ```
+  fractional component exceeds decimals [ See: https://links.ethers.org/v5-errors-NUMERIC_FAULT ]
+  (fault="underflow", operation="parseFixed", code=NUMERIC_FAULT, version=bignumber/5.8.0)
+  ```
+- Error occurs after allowance check passes
+- Affects both BUY and SELL operations
+- Works fine for Solana trades (Jupiter, Meteora, Raydium)
+
+**Root Cause**:
+JavaScript floating point precision issue in gas price calculation in `gateway/src/chains/ethereum/ethereum.ts`:
+
+```typescript
+// Line 158: Multiply creates excessive decimal places
+const bufferedGasPriceInGwei = gasPriceInGwei * 1.1;
+
+// Example: 0.013242 * 1.1 = 0.014566200000000001 (18 decimal places!)
+
+// Line 162: parseUnits fails because Gwei only supports 9 decimal places
+gasOptions.gasPrice = utils.parseUnits(bufferedGasPriceInGwei.toString(), 'gwei');
+// ❌ Error: "fractional component exceeds decimals"
+```
+
+**The Fix**:
+
+File: `gateway/src/chains/ethereum/ethereum.ts` (lines 162-164)
+
+```typescript
+// BEFORE (Broken):
+gasOptions.gasPrice = utils.parseUnits(bufferedGasPriceInGwei.toString(), 'gwei');
+
+// AFTER (Fixed):
+// Round to 9 decimal places (max for Gwei) to avoid floating point precision issues
+const roundedGasPrice = bufferedGasPriceInGwei.toFixed(9);
+gasOptions.gasPrice = utils.parseUnits(roundedGasPrice, 'gwei');
+```
+
+**How to Apply the Fix**:
+
+1. **Edit the file**:
+   ```bash
+   cd gateway
+   # Edit src/chains/ethereum/ethereum.ts at line 162-164
+   # Add the rounding step before parseUnits
+   ```
+
+2. **Build Gateway** (with workaround for unrelated TypeScript errors):
+   ```bash
+   # Temporarily rename problematic files
+   mv src/chains/ethereum/infura-service.ts src/chains/ethereum/infura-service.ts.skip
+   mv src/chains/solana/helius-service.ts src/chains/solana/helius-service.ts.skip
+   mv src/chains/solana/solana-priority-fees.ts src/chains/solana/solana-priority-fees.ts.skip
+
+   # Build
+   pnpm build
+
+   # Restore files
+   mv src/chains/ethereum/infura-service.ts.skip src/chains/ethereum/infura-service.ts
+   mv src/chains/solana/helius-service.ts.skip src/chains/solana/helius-service.ts
+   mv src/chains/solana/solana-priority-fees.ts.skip src/chains/solana/solana-priority-fees.ts
+   ```
+
+3. **Restart Gateway**:
+   ```bash
+   # Your usual Gateway start command
+   pnpm start --passphrase=<PASSPHRASE>
+   ```
+
+4. **Verify the fix**:
+   ```bash
+   # Test a BUY trade on any EVM network
+   mosquitto_pub -h localhost -t hbot/signals/test/fix -m '{
+     "action":"BUY",
+     "symbol":"WBTC-USDC",
+     "network":"arbitrum",
+     "exchange":"uniswap",
+     "pool_type":"clmm",
+     "amount":1
+   }'
+
+   # Check Gateway logs - should see successful transaction
+   tail -f gateway/logs/logs_gateway_app.log.$(date +%Y-%m-%d)
+   ```
+
+**Why This Happened**:
+- This bug was introduced by commit `36d4e49f` (Sep 17, 2025) which modified gas pricing logic
+- The commit aimed to fix other issues but inadvertently introduced floating point precision problems
+- JavaScript's floating point arithmetic creates numbers with more decimal places than ethers.js `parseUnits` can handle
+
+**Impact**:
+- **Critical**: Breaks ALL EVM network trading (Uniswap, 0x on Ethereum, Arbitrum, Base, Optimism, Polygon, etc.)
+- Does not affect Solana trading
+- Affects both small ($10) and large trades
+- Your previous working API codebase likely used an older Gateway version without this bug
+
+**Verification**:
+After applying the fix, you should see in Gateway logs:
+```
+Using legacy gas pricing: 0.014566 GWEI (estimated: 0.013242 GWEI + 10% buffer) with gasLimit: 350000
+Transaction sent: 0x...
+Transaction confirmed: 0x...
+```
+
+Instead of:
+```
+Swap execution error: fractional component exceeds decimals
+```
+
+**Date Discovered**: 2025-10-11
+**Affected Gateway Versions**: dev-2.9.0 (commits after Sep 17, 2025)
+**Status**: **FIXED** - Critical for production use
+
+---
+
+## 6. Potential Breaking Changes to Watch For
 
 ### High Risk (Likely to require adaptation):
 
@@ -230,7 +349,7 @@ def _execute_with_network_override(self, operation):
 
 ---
 
-## 6. Information Needed for Migration Support
+## 7. Information Needed for Migration Support
 
 ### Essential Information to Provide:
 
@@ -285,7 +404,7 @@ def _execute_with_network_override(self, operation):
 
 ---
 
-## 7. Rollback Procedure
+## 8. Rollback Procedure
 
 If upgrade fails:
 
