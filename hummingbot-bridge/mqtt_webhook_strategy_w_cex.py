@@ -157,8 +157,12 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
         self.last_reset_date = datetime.now(timezone.utc).date()
         self.request_timeout: int = 30
 
-        # Cache configuration
-        self.gateway_config_cache_ttl: int = 300  # 5 minutes
+        # Cache configuration with environment variables
+        self.gateway_config_cache_ttl: int = int(os.getenv("HBOT_GATEWAY_CONFIG_CACHE_TTL", "300"))  # 5 minutes default
+        self.rate_oracle_update_interval: int = int(os.getenv("HBOT_RATE_ORACLE_UPDATE_INTERVAL", "10"))  # 10 seconds default
+        self.config_refresh_interval: int = int(os.getenv("HBOT_CONFIG_REFRESH_INTERVAL", "300"))  # 5 minutes default
+        self.predictive_stats_log_interval: int = int(os.getenv("HBOT_PREDICTIVE_STATS_LOG_INTERVAL", "300"))  # 5 minutes default
+
         self._gateway_config_cache: Dict = {}
         self._balance_cache: Dict = {}
         self._last_gateway_refresh = 0
@@ -401,14 +405,151 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                     del self.active_positions[base_token]
                     self.logger().info(f"📝 Position closed: {base_token}")
 
+            # Inject DEX price into rate oracle BEFORE MarketsRecorder calculates fees/PnL
+            # This prevents "Could not find exchange rate" warnings for DEX-only pairs like RAY-USDC
+            try:
+                rate_oracle = RateOracle.get_instance()
+                # trading_pair is in format "RAY-USDC" - perfect for rate oracle
+                rate_oracle.set_price(trading_pair, Decimal(str(event.price)))
+                self.logger().debug(f"📊 Injected {trading_pair} = ${event.price:.6f} into rate oracle")
+            except Exception as oracle_err:
+                self.logger().debug(f"⚠️ Could not inject price into rate oracle: {oracle_err}")
+
             # Clean up tracking entry
             del self._dex_order_tracking[event.order_id]
 
             # Note: MarketsRecorder automatically persists this event to database
             # No manual database writes needed - the framework handles it
 
+            # Fetch and update gas fees for EVM transactions (async, non-blocking)
+            if event.exchange_trade_id and exchange:
+                safe_ensure_future(self._fetch_and_update_gas_fee(
+                    tx_hash=event.exchange_trade_id,
+                    exchange=exchange,
+                    trading_pair=trading_pair
+                ))
+
         except Exception as e:
             self.logger().error(f"❌ Error in did_fill_order handler: {e}", exc_info=True)
+
+    async def _fetch_and_update_gas_fee(self, tx_hash: str, exchange: str, trading_pair: str):
+        """
+        Fetch actual gas cost from blockchain and update TradeFill record.
+        Supports both EVM (Ethereum, Arbitrum, etc.) and Solana chains.
+
+        Args:
+            tx_hash: Transaction hash / exchange_trade_id
+            exchange: Exchange name (e.g., 'uniswap', 'jupiter')
+            trading_pair: Trading pair for logging
+        """
+        try:
+            # Give the transaction time to confirm and MarketsRecorder to save
+            await asyncio.sleep(5)
+
+            # Determine if this is a Solana DEX
+            is_solana = any(sol_dex in exchange.lower() for sol_dex in ['jupiter', 'raydium', 'orca', 'meteora'])
+
+            # Get the connector to access Gateway
+            connector = self._get_dex_connector(exchange, 'clmm')  # Type doesn't matter for provider access
+            if not connector or not hasattr(connector, '_get_gateway_instance'):
+                return
+
+            # Use Gateway to poll transaction status
+            gateway = connector._get_gateway_instance()
+            network = connector.network if hasattr(connector, 'network') else ('mainnet-beta' if is_solana else 'arbitrum')
+
+            # Poll transaction to get receipt with gas info
+            # For Solana, we need to pass tokens and wallet address to get accurate fee calculation
+            if is_solana:
+                # Extract tokens from trading pair (e.g., "WBTC-USDC" -> ["WBTC", "USDC"])
+                tokens = trading_pair.split('-') if '-' in trading_pair else []
+                wallet_address = connector.address if hasattr(connector, 'address') else None
+
+                tx_status = await gateway.get_transaction_status(
+                    chain=connector.chain,
+                    network=network,
+                    tx_hash=tx_hash,
+                    tokens=tokens,
+                    walletAddress=wallet_address
+                )
+            else:
+                # EVM chains don't need tokens/wallet for fee calculation
+                tx_status = await gateway.get_transaction_status(
+                    chain=connector.chain,
+                    network=network,
+                    tx_hash=tx_hash
+                )
+
+            # Extract gas fee if available
+            gas_fee = tx_status.get('fee')
+            if gas_fee and float(gas_fee) > 0:
+                # Determine native currency
+                native_currency = 'SOL' if is_solana else (connector._native_currency if hasattr(connector, '_native_currency') else 'ETH')
+
+                # Update the TradeFill record in database
+                await self._update_trade_fill_gas_fee(tx_hash, gas_fee, native_currency)
+                self.logger().info(
+                    f"💰 Updated gas fee for {trading_pair}: {gas_fee} {native_currency} (tx: {tx_hash[:10]}...)"
+                )
+            else:
+                self.logger().debug(f"⚠️ No gas fee returned for tx {tx_hash[:10]}...")
+
+        except Exception as e:
+            self.logger().debug(f"⚠️ Could not fetch gas fee for {tx_hash[:10]}...: {e}")
+
+    async def _update_trade_fill_gas_fee(self, tx_hash: str, gas_fee: float, fee_token: str):
+        """
+        Update TradeFill record with actual gas fee.
+
+        Args:
+            tx_hash: Transaction hash (exchange_trade_id)
+            gas_fee: Gas fee in native token (e.g., ETH)
+            fee_token: Token symbol (e.g., 'ETH')
+        """
+        try:
+            from hummingbot.model.trade_fill import TradeFill
+            from hummingbot.client.hummingbot_application import HummingbotApplication
+
+            # Get database session
+            app = HummingbotApplication.main_application()
+            if not app or not hasattr(app, 'markets_recorder'):
+                return
+
+            sql_manager = app.markets_recorder.sql_manager
+
+            with sql_manager.get_new_session() as session:
+                # Find the TradeFill record by exchange_trade_id
+                trade_fill = session.query(TradeFill).filter(
+                    TradeFill.exchange_trade_id == tx_hash
+                ).first()
+
+                if trade_fill:
+                    # Update trade_fee JSON to include gas cost
+                    try:
+                        fee_data = json.loads(trade_fill.trade_fee) if trade_fill.trade_fee else {}
+                    except:
+                        fee_data = {}
+
+                    # Add or update flat_fees with gas cost
+                    if 'flat_fees' not in fee_data:
+                        fee_data['flat_fees'] = []
+
+                    # Add gas fee as a flat fee
+                    fee_data['flat_fees'].append({
+                        'token': fee_token,
+                        'amount': str(gas_fee)
+                    })
+
+                    # Update the record
+                    trade_fill.trade_fee = json.dumps(fee_data)
+                    session.commit()
+
+                    self.logger().debug(f"✅ Updated TradeFill record with gas fee: {gas_fee} {fee_token}")
+                else:
+                    self.logger().debug(f"⚠️ TradeFill record not found for tx {tx_hash[:10]}...")
+
+        except Exception as e:
+            self.logger().error(f"❌ Error updating TradeFill gas fee: {e}", exc_info=True)
 
     async def _update_rate_oracle_for_dex_positions(self):
         """
@@ -512,21 +653,22 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
             if not hasattr(self, '_last_predictive_stats_log'):
                 self._last_predictive_stats_log = current_time
 
-            if current_time - self._last_predictive_stats_log > 300:  # 5 minutes
+            if current_time - self._last_predictive_stats_log > self.predictive_stats_log_interval:
                 if self.predictive_stats['attempts'] > 0:
                     self.log_predictive_stats()
                 self._last_predictive_stats_log = current_time
 
-            # Update rate oracle with DEX prices for active positions (every 10 seconds)
+            # Update rate oracle with DEX prices for active positions (configurable interval)
             if not hasattr(self, '_last_rate_oracle_update'):
                 self._last_rate_oracle_update = current_time
 
-            if current_time - self._last_rate_oracle_update > 10:  # Update every 10 seconds
+            if current_time - self._last_rate_oracle_update > self.rate_oracle_update_interval:
                 safe_ensure_future(self._update_rate_oracle_for_dex_positions())
                 self._last_rate_oracle_update = current_time
 
+            # Periodic configuration refresh (configurable interval)
             time_since_refresh = current_time - self._last_config_refresh
-            if time_since_refresh > 300:  # 5 minutes
+            if time_since_refresh > self.config_refresh_interval:
                 self.logger().debug("🔄 Performing periodic configuration refresh...")
                 safe_ensure_future(self._refresh_configuration())
                 self._last_config_refresh = current_time
@@ -2798,7 +2940,7 @@ class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
                                       pool: str = None, signal_data: dict = None) -> bool:
         """
         Execute SELL trade on EVM networks using connector framework.
-        For EVM SELL: We invert to BUY USDC-WBTC (buying USDC with WBTC)
+        For EVM SELL: Sells base token (e.g., WBTC) for quote token (e.g., USDC) using is_buy=False
 
         This method uses connector.place_order() which:
         - Triggers OrderFilledEvent when complete

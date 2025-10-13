@@ -1,0 +1,1269 @@
+# 🎓 Hummingbot v2.9.0 Best Practices & Lessons Learned
+# Updated: October 11, 2025
+
+## 📋 **EXECUTIVE SUMMARY**
+
+This document consolidates critical lessons learned from the production deployment of Hummingbot v2.9.0 with Gateway v2.9.0, featuring multi-venue trading across DEXs and CEXs with webhook automation.
+
+**Major Architecture Update**: Migrated from direct Gateway API calls to Hummingbot's connector framework, enabling automatic trade recording, event-driven execution, and MarketsRecorder integration.
+
+**Current Status**: Production-ready system with connector-based architecture, Jupiter aggregator, 5+ DEX integrations, CEX integration, and MQTT-based signal processing.
+
+---
+
+## 🏗️ **CORE ARCHITECTURAL PRINCIPLES**
+
+### **1. Connector-Based Architecture (v2.9.0+)**
+**CRITICAL CHANGE**: The system has evolved from direct Gateway API calls to using Hummingbot's connector framework.
+
+#### **Why Connector Architecture?**
+1. **Automatic Trade Recording**: MarketsRecorder automatically persists all trades to database
+2. **Event-Driven Execution**: OrderFilledEvent triggers automatic cleanup and tracking
+3. **Framework Integration**: Clock-driven execution, order book tracking, balance management
+4. **Unified Interface**: Same pattern for CEX and DEX trading
+5. **Built-in Retry Logic**: Connectors handle retries, gas estimation, and error recovery
+
+#### **Connector Declaration Pattern**
+```python
+# ✅ PRODUCTION PATTERN - Declare connectors in markets dict
+class EnhancedMQTTWebhookStrategy(ScriptStrategyBase):
+    markets = {
+        # CEX connector
+        os.getenv("HBOT_CEX_DEFAULT_EXCHANGE", "coinbase_advanced_trade"):
+            os.getenv("HBOT_CEX_TRADING_PAIRS", "ETH-USD,BTC-USD,SOL-USD").split(","),
+
+        # Gateway DEX connectors - Use format: {name}/{type}
+        "jupiter/router": set(),     # Jupiter (Solana router)
+        "raydium/amm": set(),        # Raydium AMM
+        "raydium/clmm": set(),       # Raydium CLMM
+        "meteora/clmm": set(),       # Meteora CLMM
+        "uniswap/amm": set(),        # Uniswap V2-style AMM
+        "uniswap/clmm": set(),       # Uniswap V3 CLMM
+    }
+```
+
+**Framework automatically:**
+- Creates and initializes connectors
+- Starts them with the strategy clock
+- Registers them with MarketsRecorder
+- Handles event propagation
+- Manages connection lifecycle
+
+#### **Network Adapter Pattern for Multi-Chain**
+```python
+# ✅ NETWORK ADAPTER PATTERN - Dynamic network switching
+from hummingbot.connector.gateway.core.gateway_network_adapter import GatewayNetworkAdapter
+
+def _get_dex_connector(self, exchange: str, pool_type: str = None, network: str = None):
+    """
+    Get DEX connector with network adapter for dynamic network switching.
+    Network is NOT part of the connector key - it's a parameter for Gateway API calls.
+    """
+    # Build connector key without network: "jupiter/router", "uniswap/clmm"
+    connector_key = f"{exchange.lower()}/{pool_type}"
+
+    if connector_key in self.connectors:
+        base_connector = self.connectors[connector_key]
+
+        # Wrap with network adapter to enable dynamic network switching
+        adapter = GatewayNetworkAdapter(base_connector, network)
+        return adapter
+
+    return None
+```
+
+**Key Insight**: One connector instance (e.g., `uniswap/clmm`) can trade on multiple networks (arbitrum, mainnet, base) by wrapping it with GatewayNetworkAdapter and specifying the network per trade.
+
+#### **Event-Driven Trade Execution**
+```python
+# ✅ CONNECTOR TRADE EXECUTION PATTERN
+async def _execute_evm_buy_trade(self, base_token: str, network: str, exchange: str,
+                                 amount: float, pool: str = None, signal_data: dict = None):
+    """
+    Execute BUY trade using connector framework (event-driven approach).
+
+    This method uses connector.place_order() which:
+    - Triggers OrderFilledEvent when complete
+    - Automatically records to database via MarketsRecorder
+    - Handles retries and gas management internally
+    """
+    # Get connector for this exchange (network-specific for EVM)
+    connector = self._get_dex_connector(exchange, pool_type, network)
+
+    # Calculate amounts
+    base_amount_to_receive = Decimal(str(amount)) / Decimal(str(base_price))
+
+    # Place order through connector (async execution)
+    order_id = connector.place_order(
+        is_buy=True,                          # BUY operation
+        trading_pair=f"{base_token}-USDC",   # Natural pair order
+        amount=base_amount_to_receive,        # Amount of base token to receive
+        price=current_price                   # Price in quote token
+    )
+
+    # Track order for event handling
+    self._dex_order_tracking[order_id] = {
+        "signal_data": signal_data or {},
+        "exchange": exchange,
+        "pool_type": pool_type,
+        "trading_pair": trading_pair,
+        "base_token": base_token,
+        "network": network,
+        "timestamp": time.time()
+    }
+
+    # Note: Order execution happens asynchronously
+    # The did_fill_order() event handler will be called when trade completes
+    # MarketsRecorder automatically persists to database
+    return True
+```
+
+#### **Event Handler Pattern**
+```python
+# ✅ ORDER FILLED EVENT HANDLER
+def did_fill_order(self, event: OrderFilledEvent):
+    """
+    Event handler called when a DEX order is filled.
+    Automatically triggered by connector framework when trades complete.
+    MarketsRecorder automatically persists this event to TradeFill database table.
+    """
+    try:
+        # Check if this is one of our tracked DEX orders
+        if event.order_id not in self._dex_order_tracking:
+            return  # Not our order
+
+        # Retrieve trade context
+        order_info = self._dex_order_tracking[event.order_id]
+        exchange = order_info.get("exchange")
+        base_token = order_info.get("base_token")
+
+        # Log completion
+        self.logger().info(
+            f"✅ DEX Order Filled: {event.trade_type.name} {event.trading_pair}\n"
+            f"   Amount: {event.amount}, Price: {event.price}\n"
+            f"   TX Hash: {event.exchange_trade_id}"
+        )
+
+        # Clean up position tracking for SELL orders
+        if event.trade_type.name == "SELL" and base_token:
+            if base_token in self.active_positions:
+                del self.active_positions[base_token]
+
+        # Clean up tracking
+        del self._dex_order_tracking[event.order_id]
+
+        # Note: MarketsRecorder automatically persists this event to database
+        # No manual database writes needed - the framework handles it
+
+    except Exception as e:
+        self.logger().error(f"❌ Error in did_fill_order handler: {e}", exc_info=True)
+```
+
+**Benefits of Connector Architecture:**
+- ✅ Automatic trade recording (no manual DB writes)
+- ✅ Event-driven cleanup and tracking
+- ✅ Framework-managed retries and error handling
+- ✅ Gas price recording for analytics
+- ✅ Unified CEX/DEX execution interface
+- ✅ Position tracking with event confirmation
+- ✅ Transaction hash capture and explorer links
+
+---
+
+### **2. Multi-Venue Trading Architecture**
+**Pattern**: Unified strategy supporting both CEX and DEX execution with intelligent routing.
+
+```python
+# ✅ PRODUCTION PATTERN - Smart routing logic
+def _should_use_cex(self, signal_data: Dict) -> bool:
+    """
+    Determine whether to route order to CEX or DEX.
+
+    CEX Routing Rules:
+    - Explicit CEX request (exchange="coinbase")
+    - Preferred tokens (BTC, ETH)
+    - Large orders (>$50)
+
+    DEX Routing Rules:
+    - Network-specific tokens
+    - DeFi tokens without CEX support
+    - Default for all other cases
+    """
+    if not self.cex_enabled or not self.cex_ready:
+        return False
+
+    # Check if signal explicitly specifies CEX
+    exchange = signal_data.get("exchange", "").lower()
+    if "coinbase" in exchange or "cex" in exchange:
+        return True
+
+    # Route preferred tokens to CEX (better liquidity)
+    symbol = signal_data.get("symbol", "").upper()
+    base_token = symbol.replace("USDC", "").replace("USD", "")
+    if base_token in self.cex_preferred_tokens:
+        self.logger().info(f"📊 Routing {base_token} to CEX (preferred token)")
+        return True
+
+    # Route large orders to CEX (lower slippage)
+    if self.use_cex_for_large_orders:
+        amount = float(signal_data.get("amount", self.trade_amount))
+        if amount >= self.cex_threshold_amount:
+            self.logger().info(f"📊 Routing ${amount} order to CEX (above threshold)")
+            return True
+
+    # Default to DEX
+    return False
+```
+
+```python
+# ✅ ROUTING ORCHESTRATION
+async def _process_trading_signal(self, signal_data: Dict) -> None:
+    """Route signals to CEX or DEX based on configuration"""
+    action = signal_data.get("action", "").upper()
+    symbol = signal_data.get("symbol", "")
+
+    # Route to CEX or DEX
+    if self._should_use_cex(signal_data):
+        success = await self._route_to_cex(action, symbol, signal_data)
+    else:
+        success = await self._route_to_dex(action, symbol, network, exchange, signal_data)
+
+    # Update statistics
+    if success:
+        self._update_daily_statistics(action)
+        self.successful_trades += 1
+```
+
+---
+
+### **3. Gateway API Integration (Reference)**
+**Historical Context**: Before connector architecture, we used direct Gateway API calls.
+
+#### **Why We Moved Away from Direct API Calls**
+1. ❌ Manual transaction tracking required
+2. ❌ No automatic database persistence
+3. ❌ Manual retry logic implementation
+4. ❌ No framework integration
+5. ❌ Complex state management
+
+#### **API-Based Pattern (For Reference Only)**
+```python
+# ⚠️ LEGACY PATTERN - Direct Gateway API calls (deprecated)
+async def _execute_gateway_swap_api(self, trade_request: Dict) -> Dict:
+    """
+    OLD METHOD: Direct Gateway API swap execution
+    REPLACED BY: connector.place_order() with event-driven execution
+
+    Kept here for reference in case API access is needed for:
+    - Custom operations not supported by connectors
+    - Direct Gateway configuration queries
+    - Price quotes and pool discovery
+    """
+    endpoint = f"/connectors/{exchange}/{pool_type}/swap"
+
+    swap_request = {
+        "network": network,
+        "address": wallet_address,
+        "baseToken": base_token,
+        "quoteToken": quote_token,
+        "amount": amount,
+        "side": "BUY" or "SELL",
+        "slippage": self.slippage_tolerance
+    }
+
+    # Direct API call (no framework integration)
+    response = await self.gateway_request("POST", endpoint, swap_request)
+
+    # Manual tracking required
+    if "signature" in response:
+        tx_hash = response["signature"]
+        # Must manually record to database
+        await self._record_trade_to_database(tx_hash, trade_request)
+
+    return response
+```
+
+#### **When to Use Direct API Calls**
+Keep API methods available for:
+1. **Configuration Queries**: Pool discovery, token lists, network info
+2. **Price Quotes**: Getting quotes without executing trades
+3. **Pool Information**: Checking liquidity, APY, pool details
+4. **Gateway Health**: Status checks and diagnostics
+
+```python
+# ✅ VALID API USE CASE - Price quotes
+async def _get_token_price_in_usd(self, token: str, network: str, exchange: str):
+    """Use API for price quotes (no trade execution)"""
+    endpoint = f"/connectors/{exchange}/{pool_type}/quote-swap"
+
+    price_params = {
+        "network": network,
+        "baseToken": token,
+        "quoteToken": "USDC",
+        "amount": "1",
+        "side": "SELL"
+    }
+
+    response = await self.gateway_request("GET", endpoint, params=price_params)
+
+    if "amountOut" in response:
+        return Decimal(str(response["amountOut"]))
+```
+
+---
+
+## 🚀 **WEBHOOK SIGNAL INTEGRATION**
+
+### **TradingView Webhook Format (Latest)**
+```bash
+# Current production format with pool_type parameter
+curl -X POST https://hummingbot.ngrok.app/webhook/hummingbot \
+  -H "Content-Type: application/json" \
+  -d '{
+    "api_key": "'$HBOT_WEBHOOK_API_KEY'",
+    "action": "BUY",              # BUY or SELL
+    "symbol": "WBTC-USDC",        # Trading pair (hyphenated)
+    "exchange": "uniswap",        # Exchange name
+    "network": "arbitrum",        # Network identifier
+    "pool_type": "clmm",          # Pool type: amm, clmm, or router
+    "amount": 10.0                # Optional: override default amount
+  }'
+```
+
+**Key Parameters:**
+- `pool_type`: Eliminates guessing - webhook specifies exact pool type
+- `network`: Enables multi-chain support with single connector
+- `symbol`: Use hyphenated format (WBTC-USDC) for clarity
+- `amount`: Optional per-trade amount override
+
+### **Signal Flow Architecture**
+```
+TradingView → Webhook Bridge → MQTT → Strategy → Connector → Gateway → Blockchain
+     ↓            ↓                ↓        ↓           ↓          ↓          ↓
+   Signal    Validation      Queue   Routing    place_order  Transaction  Execution
+                                                      ↓
+                                              OrderFilledEvent
+                                                      ↓
+                                              MarketsRecorder
+```
+
+---
+
+## 💰 **TRADING LOGIC PATTERNS**
+
+### **1. Buy Trade Execution (Connector Pattern)**
+```python
+# ✅ CONNECTOR BUY PATTERN - Event-driven execution
+async def _execute_evm_buy_trade(self, base_token: str, network: str,
+                                 exchange: str, amount: float, pool: str = None):
+    """
+    Execute BUY trade: Spend USDC to acquire base_token
+
+    Key Insight: For BUY, we calculate how much base token we'll receive
+    for our USD budget, then place order with that amount.
+    """
+    # Get price from DEX
+    base_price = await self._get_token_price_in_usd(base_token, network, exchange)
+
+    # Calculate base token amount to receive
+    base_amount_to_receive = Decimal(str(amount)) / Decimal(str(base_price))
+
+    # Get connector with network adapter
+    connector = self._get_dex_connector(exchange, pool_type, network)
+
+    # Place order (async execution)
+    order_id = connector.place_order(
+        is_buy=True,                          # BUY operation
+        trading_pair=f"{base_token}-USDC",   # Natural pair order (no inversion!)
+        amount=base_amount_to_receive,        # Amount of base token to receive
+        price=Decimal(str(base_price))       # Price in USDC per base token
+    )
+
+    # Track for event handling
+    self._dex_order_tracking[order_id] = {...}
+
+    # Event handler will be called when trade completes
+    return True
+```
+
+### **2. Sell Trade Execution (Connector Pattern)**
+```python
+# ✅ CONNECTOR SELL PATTERN - Natural pair order
+async def _execute_evm_sell_trade(self, base_token: str, network: str,
+                                   exchange: str, percentage: float):
+    """
+    Execute SELL trade: Sell base_token for USDC
+
+    Key Insight: NO PAIR INVERSION! Use natural order (WBTC-USDC)
+    with is_buy=False to indicate selling base token.
+    """
+    # Get balance
+    balance = await self._get_token_balance(base_token, network)
+    sell_amount = Decimal(str(float(balance) * (percentage / 100.0)))
+
+    # Get connector
+    connector = self._get_dex_connector(exchange, pool_type, network)
+
+    # Place order (async execution)
+    order_id = connector.place_order(
+        is_buy=False,                        # SELL operation
+        trading_pair=f"{base_token}-USDC",  # Natural pair order (no inversion!)
+        amount=sell_amount,                  # Amount of base token to sell
+        price=current_price                  # Price in USDC per base token
+    )
+
+    # Gateway connector handles swap direction internally via is_buy parameter
+    # We maintain natural pair format (BASE-QUOTE) for both BUY and SELL
+
+    return True
+```
+
+**Critical Lesson**: NO PAIR INVERSION for sells! The old docstring that mentioned "inverting to BUY USDC-WBTC" was misleading. Both BUY and SELL use natural pair order (WBTC-USDC), with the `is_buy` flag indicating direction.
+
+### **3. CEX Trading (Connector Pattern)**
+```python
+# ✅ CEX BUY PATTERN - USD-based execution
+async def _execute_cex_buy(self, symbol: str, usd_amount: float) -> bool:
+    """Buy using USD on CEX with predictive selling tracking"""
+    base_token = self._extract_base_token_from_symbol(symbol)
+    trading_pair = f"{base_token}-USD"
+
+    # Get order book
+    order_book = self.cex_connector.get_order_book(trading_pair)
+    ask_price_decimal = Decimal(str(order_book.get_price(True)))
+
+    # Calculate amount accounting for fees
+    expected_amount = Decimal(str(usd_amount)) / ask_price_decimal
+
+    # Place order (uses connector framework, not place_order for CEX)
+    order_id = self.cex_connector.buy(
+        trading_pair=trading_pair,
+        amount=expected_amount,
+        order_type=OrderType.MARKET,
+        price=ask_price_decimal
+    )
+
+    # Track for predictive selling
+    self._pending_balances[base_token] = {
+        'order_id': order_id,
+        'timestamp': time.time(),
+        'expected_amount': float(expected_amount),
+        'price': float(ask_price_decimal)
+    }
+
+    return True
+```
+
+### **4. Predictive Selling (CEX)**
+```python
+# ✅ PREDICTIVE SELL PATTERN - Conservative estimates
+async def _execute_cex_sell(self, symbol: str, percentage: float) -> bool:
+    """
+    Execute CEX sell with predictive selling capability.
+
+    For recent buys (<60s), use expected amount instead of waiting for balance update.
+    This enables immediate buy-sell cycles without balance confirmation delays.
+    """
+    base_token = self._extract_base_token_from_symbol(symbol)
+
+    # Check for recent buy (predictive window)
+    use_predictive = False
+    if base_token in self._pending_balances:
+        pending = self._pending_balances[base_token]
+        time_since_buy = time.time() - pending['timestamp']
+
+        if time_since_buy < self.cex_predictive_window:  # 60 seconds
+            use_predictive = True
+
+            # Use conservative estimate (99.5% of expected after fees)
+            expected = Decimal(str(pending['expected_after_fees']))
+            safety_factor = Decimal("0.995")
+            predictive_amount = expected * safety_factor * Decimal(str(percentage / 100.0))
+
+            sell_amount = predictive_amount
+            self.predictive_stats['attempts'] += 1
+
+    if not use_predictive:
+        # Normal balance check for older trades
+        balances = self.cex_connector.get_all_balances()
+        if asyncio.iscoroutine(balances):
+            balances = await balances
+
+        base_balance = balances.get(base_token, Decimal("0"))
+        sell_amount = base_balance * Decimal(str(percentage / 100.0))
+
+    # Execute sell
+    order_id = self.cex_connector.sell(
+        trading_pair=f"{base_token}-USD",
+        amount=sell_amount,
+        order_type=OrderType.MARKET,
+        price=bid_price
+    )
+
+    if use_predictive:
+        self.predictive_stats['successes'] += 1
+
+    return True
+```
+
+---
+
+## 🛡️ **SAFETY & RISK MANAGEMENT**
+
+### **1. Gas Protection (Critical for Solana)**
+```python
+# ✅ SOL MINIMUM BALANCE PROTECTION
+HBOT_MIN_SOL_BALANCE=0.02  # Never sell if SOL < this amount
+
+async def _execute_solana_sell_trade(self, base_token: str, percentage: float):
+    """Sell with SOL gas protection"""
+    balance = await self._get_token_balance(base_token, network)
+    sell_amount = float(balance) * (percentage / 100.0)
+
+    # SOL minimum balance protection for gas fees
+    if base_token == "SOL" and quote_token in ["USDC", "USDT"]:
+        if sell_amount > (float(balance) - self.min_sol_balance):
+            sell_amount = max(0.0, float(balance) - self.min_sol_balance)
+
+            self.logger().info(
+                f"🛡️ SOL protection: Preserving {self.min_sol_balance} SOL for gas"
+            )
+
+            if sell_amount <= 0:
+                self.logger().warning("⚠️ Cannot sell - would leave insufficient gas")
+                return False
+
+    # Proceed with sell
+    return await self._place_connector_sell_order(sell_amount)
+```
+
+### **2. Daily Limits & Controls**
+```python
+# ✅ COMPREHENSIVE LIMIT SYSTEM
+HBOT_MAX_DAILY_TRADES=50        # Maximum trades per day
+HBOT_MAX_DAILY_VOLUME=10000.0   # Maximum USD volume per day
+HBOT_CEX_DAILY_LIMIT=1000.0     # CEX-specific daily limit
+HBOT_SLIPPAGE_TOLERANCE=1.0     # Maximum acceptable slippage %
+
+def _validate_trading_signal(self, signal_data: Dict) -> bool:
+    """Multi-layer validation with limits"""
+    # Daily limits validation
+    if self.daily_trade_count >= self.max_daily_trades:
+        self.logger().warning(
+            f"⚠️ Daily trade limit reached: {self.daily_trade_count}/{self.max_daily_trades}"
+        )
+        return False
+
+    if self.daily_volume >= self.max_daily_volume:
+        self.logger().warning(
+            f"⚠️ Daily volume limit reached: ${self.daily_volume}/${self.max_daily_volume}"
+        )
+        return False
+
+    return True
+```
+
+### **3. Rate Oracle Integration**
+```python
+# ✅ RATE ORACLE UPDATE FOR DEX POSITIONS
+async def _update_rate_oracle_for_dex_positions(self):
+    """
+    Update RateOracle with current DEX prices for active positions.
+    Fixes rate oracle warnings by injecting DEX prices for PNL calculations.
+    """
+    if not self.active_positions:
+        return
+
+    rate_oracle = RateOracle.get_instance()
+
+    for base_token, position in self.active_positions.items():
+        quote_token = position.get('quote_token', 'USDC')
+        network = position.get('network')
+
+        # Get current price from DEX
+        price = await self._get_token_price_in_usd(base_token, network, exchange)
+
+        if price:
+            # Inject price into rate oracle
+            pair = f"{base_token}-{quote_token}"
+            rate_oracle.set_price(pair, Decimal(str(price)))
+```
+
+---
+
+## 🔧 **TECHNICAL IMPLEMENTATION DETAILS**
+
+### **1. Decimal Precision Handling**
+```python
+# ✅ CRITICAL - Always use Decimal for financial calculations
+from decimal import Decimal
+
+# Convert all financial values
+price_decimal = Decimal(str(price))
+amount_decimal = Decimal(str(amount))
+total = price_decimal * amount_decimal
+
+# Token-specific precision
+if base_token in ['WBTC', 'BTC']:
+    # Bitcoin-based tokens: 8 decimals
+    amount = amount.quantize(Decimal('0.00000001'))
+elif base_token in ['USDC', 'USDT', 'DAI']:
+    # Stablecoins: 6 decimals
+    amount = amount.quantize(Decimal('0.000001'))
+else:
+    # Most ERC20 tokens: 18 decimals
+    amount = amount.quantize(Decimal('0.000000000000000001'))
+
+# NEVER mix Decimal and float without conversion
+```
+
+### **2. Connector State Management**
+```python
+# ✅ CONNECTOR INITIALIZATION PATTERN
+async def on_tick(self):
+    """Main strategy loop with proper initialization"""
+    # Skip everything during initialization phase
+    if not self._initialized:
+        if not self._initializing:
+            self._initializing = True
+            safe_ensure_future(self._initialize_strategy())
+        return  # Always return during initialization
+
+    # Process signals only after initialization
+    while self.signal_queue:
+        signal_data, topic = self.signal_queue.pop(0)
+        safe_ensure_future(self._process_trading_signal(signal_data, topic))
+
+async def _initialize_strategy(self) -> None:
+    """Initialize connectors and configuration"""
+    if self._initialized:
+        return
+
+    # Load Gateway configuration
+    await self._refresh_gateway_configuration()
+
+    # Initialize CEX connector if enabled
+    if self.cex_enabled:
+        await self._initialize_cex_connector()
+
+    # Setup MQTT
+    self._setup_mqtt()
+
+    # Mark as initialized
+    self._initialized = True
+    self._initializing = False
+```
+
+### **3. Error Handling Patterns**
+```python
+# ✅ MULTI-LAYER ERROR HANDLING WITH RETRIES
+async def _execute_trade_with_retry(self, trade_request: Dict) -> bool:
+    """Execute trade with retry logic for transient errors"""
+    max_retries = 3
+    retry_delay = 1
+
+    for attempt in range(max_retries):
+        try:
+            result = await self._execute_trade(trade_request)
+            return result
+
+        except (ConnectionError, TimeoutError, aiohttp.ClientError) as network_error:
+            if attempt < max_retries - 1:
+                self.logger().warning(
+                    f"⚠️ Network error (attempt {attempt + 1}/{max_retries}): {network_error}"
+                )
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+                continue
+            else:
+                self.logger().error(f"❌ Network error after {max_retries} attempts")
+                return False
+
+        except Exception as unexpected:
+            self.logger().error(f"❌ Unexpected error: {unexpected}", exc_info=True)
+            return False
+```
+
+### **4. Pool Type Resolution**
+```python
+# ✅ POOL INFO LOOKUP WITH WEBHOOK HINT
+async def _get_pool_info(self, network: str, exchange: str, pool_key: str = None,
+                         pool_address: str = None, pool_type: str = None) -> Optional[Dict]:
+    """
+    Get pool info from configuration with pool_type hint from webhook.
+
+    Pool type priority:
+    1. Webhook-provided pool_type (most accurate)
+    2. Router auto-detection (jupiter, 0x)
+    3. Configuration lookup
+    4. Fallback defaults
+    """
+    # Case 1: Webhook provided pool_type directly
+    if pool_type and pool_type in ['amm', 'clmm', 'router']:
+        self.logger().info(f"🎯 Using webhook pool_type: {pool_type}")
+
+        # Router types don't need pool addresses
+        if pool_type == 'router':
+            return {
+                'address': None,
+                'type': pool_type,
+                'base_token': tokens[0],
+                'quote_token': tokens[1],
+                'connector': exchange
+            }
+
+        # Look up pool address for AMM/CLMM
+        if network in self.pool_configurations:
+            network_pools = self.pool_configurations[network]
+
+            if exchange in network_pools:
+                exchange_pools = network_pools[exchange]
+
+                if pool_type in exchange_pools and pool_key in exchange_pools[pool_type]:
+                    pool_address = exchange_pools[pool_type][pool_key]
+                    return {
+                        'address': pool_address,
+                        'type': pool_type,
+                        'base_token': tokens[0],
+                        'quote_token': tokens[1],
+                        'connector': exchange
+                    }
+
+    # Case 2: Auto-detect router types
+    if exchange and exchange.lower() in ['jupiter', '0x']:
+        return {'address': None, 'type': 'router', ...}
+
+    # Case 3: Configuration lookup fallback
+    # ... (existing logic)
+```
+
+---
+
+## 📊 **CONFIGURATION MANAGEMENT**
+
+### **Environment Variables (Complete List)**
+```bash
+# ==========================================
+# CORE SETTINGS
+# ==========================================
+HUMMINGBOT_VERSION=2.9.0
+GATEWAY_VERSION=2.9.0
+
+# ==========================================
+# TRADING PARAMETERS
+# ==========================================
+HBOT_TRADE_AMOUNT=10.0              # Default trade size in USD
+HBOT_SELL_PERCENTAGE=99.999         # Percentage of balance to sell
+HBOT_SLIPPAGE_TOLERANCE=1.0         # Maximum slippage %
+
+# ==========================================
+# RISK MANAGEMENT
+# ==========================================
+HBOT_MAX_DAILY_TRADES=50            # Maximum trades per day
+HBOT_MAX_DAILY_VOLUME=10000.0       # Maximum USD volume per day
+HBOT_MIN_SOL_BALANCE=0.02           # SOL gas protection
+HBOT_MIN_SELL_AMOUNT=0.001          # Minimum sell amount
+HBOT_BALANCE_CACHE_TTL=10           # Balance cache TTL (seconds)
+
+# ==========================================
+# CEX CONFIGURATION
+# ==========================================
+HBOT_CEX_ENABLED=true                           # Enable CEX trading
+HBOT_CEX_DEFAULT_EXCHANGE=coinbase_advanced_trade
+HBOT_CEX_TRADING_PAIRS=ETH-USD,BTC-USD,SOL-USD,ADA-USD,MATIC-USD,LINK-USD
+HBOT_CEX_PREFERRED_TOKENS=ETH,BTC               # Route these to CEX
+HBOT_CEX_MIN_ORDER_SIZE=1.2                     # Minimum order in USD
+HBOT_CEX_MAX_ORDER_SIZE=100.0                   # Maximum order size
+HBOT_CEX_DAILY_LIMIT=1000.0                     # CEX daily volume limit
+HBOT_USE_CEX_FOR_LARGE_ORDERS=true              # Route large orders to CEX
+HBOT_CEX_THRESHOLD_AMOUNT=50.0                  # Large order threshold
+
+# Predictive Selling (Experimental)
+HBOT_CEX_PREDICTIVE_SELL=true       # Enable predictive selling
+HBOT_CEX_PREDICTIVE_WINDOW=60       # Seconds to hold before selling
+HBOT_CEX_FEE_ESTIMATE=1.5           # Fee estimate % for conservative calculation
+
+# ==========================================
+# GATEWAY CONFIGURATION
+# ==========================================
+HBOT_GATEWAY_HOST=localhost
+HBOT_GATEWAY_PORT=15888
+HBOT_GATEWAY_HTTPS=true
+HBOT_GATEWAY_CERT_PATH=/path/to/client-cert.pem
+HBOT_GATEWAY_KEY_PATH=/path/to/client-key.pem
+HBOT_GATEWAY_CONF_PATH=/path/to/gateway/conf
+
+# ==========================================
+# WEBHOOK/MQTT CONFIGURATION
+# ==========================================
+HBOT_WEBHOOK_API_KEY=your_secure_key_here
+HBOT_WEBHOOK_PORT=3002
+HBOT_MQTT_HOST=localhost
+HBOT_MQTT_PORT=1883
+HBOT_WEBHOOK_MQTT_NAMESPACE=hbot
+
+# ==========================================
+# NETWORK CONFIGURATION
+# ==========================================
+HBOT_SUPPORTED_NETWORKS=arbitrum,polygon,base,mainnet,mainnet-beta
+HBOT_ARBITRUM_WALLET=0x...
+HBOT_SOLANA_WALLET=your_solana_wallet_address
+
+# ==========================================
+# GAS STRATEGY (OPTIONAL)
+# ==========================================
+HBOT_GAS_STRATEGY=adaptive          # adaptive or fixed
+HBOT_GAS_BUFFER=1.10                # 10% buffer
+HBOT_GAS_URGENCY=1.25               # 25% for urgent trades
+HBOT_GAS_MAX_GWEI=0                 # 0 = no limit (guaranteed execution)
+HBOT_GAS_RETRY_MULTIPLIER=0.15      # 15% increase per retry
+```
+
+---
+
+## 🚨 **COMMON ISSUES & SOLUTIONS**
+
+### **1. Connector Not Ready**
+```python
+# Problem: CEX connector not ready at initialization
+# Solution: Wait for ready state with timeout
+async def _ensure_cex_ready(self, timeout: float = 10.0) -> bool:
+    """Ensure CEX connector is fully ready"""
+    start_time = time.time()
+
+    while time.time() - start_time < timeout:
+        if not self.cex_ready:
+            await asyncio.sleep(0.5)
+            continue
+
+        # Try to get balances as readiness test
+        try:
+            balances = self.cex_connector.get_all_balances()
+            if asyncio.iscoroutine(balances):
+                balances = await balances
+
+            if balances is not None and isinstance(balances, dict):
+                return True
+        except Exception:
+            pass
+
+        await asyncio.sleep(0.5)
+
+    return False
+```
+
+### **2. Rate Oracle Warnings**
+```python
+# Problem: "Rate oracle not ready" warnings for DEX pairs
+# Solution: Inject DEX prices into rate oracle
+async def _update_rate_oracle_for_dex_positions(self):
+    """Update rate oracle with DEX prices"""
+    rate_oracle = RateOracle.get_instance()
+
+    for base_token, position in self.active_positions.items():
+        price = await self._get_token_price_in_usd(base_token, network, exchange)
+        if price:
+            pair = f"{base_token}-{quote_token}"
+            rate_oracle.set_price(pair, Decimal(str(price)))
+```
+
+### **3. Gateway SSL Certificate Errors**
+```python
+# Problem: SSL certificate verification failures
+# Solution: Use self-signed certificates properly
+ssl_context = ssl.create_default_context()
+ssl_context.load_cert_chain(self.gateway_cert_path, self.gateway_key_path)
+ssl_context.check_hostname = False
+ssl_context.verify_mode = ssl.CERT_NONE
+
+async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with session.get(url, ssl=ssl_context) as response:
+        return await response.json()
+```
+
+### **4. Balance Precision Errors**
+```python
+# Problem: "Insufficient balance" errors due to dust amounts
+# Solution: Use 99.9% of balance for sells with appropriate quantization
+sell_amount = balance * Decimal("0.999")
+
+# Apply token-specific quantization
+if base_token in ['WBTC', 'BTC']:
+    sell_amount = sell_amount.quantize(Decimal('0.00000001'))
+elif base_token in ['USDC', 'USDT']:
+    sell_amount = sell_amount.quantize(Decimal('0.000001'))
+else:
+    sell_amount = sell_amount.quantize(Decimal('0.000000000000000001'))
+```
+
+### **5. MQTT Compatibility**
+```python
+# Problem: paho-mqtt version conflicts
+# Solution: Universal pattern that works with all versions
+try:
+    self.mqtt_client = mqtt.Client()  # Works with both old and new versions
+except (TypeError, AttributeError):
+    self.mqtt_client = mqtt.Client()  # Fallback
+```
+
+---
+
+## 📈 **PERFORMANCE OPTIMIZATION**
+
+### **1. Caching Strategies**
+```python
+# ✅ BALANCE CACHE WITH TTL
+self.balance_cache = {}  # {token: (balance, timestamp)}
+self.balance_cache_ttl = 10  # seconds
+
+async def _get_token_balance_cached(self, token: str, network: str) -> float:
+    """Get balance with caching"""
+    cache_key = f"{token}_{network}"
+    current_time = time.time()
+
+    # Check cache
+    if cache_key in self.balance_cache:
+        balance, timestamp = self.balance_cache[cache_key]
+        if current_time - timestamp < self.balance_cache_ttl:
+            return balance
+
+    # Fetch fresh balance
+    balance = await self._get_token_balance(token, network)
+    self.balance_cache[cache_key] = (balance, current_time)
+    return balance
+```
+
+### **2. Gateway Configuration Cache**
+```python
+# ✅ GATEWAY CONFIG CACHE
+self.gateway_config_cache_ttl = 300  # 5 minutes
+
+async def _refresh_gateway_configuration(self) -> None:
+    """Refresh Gateway configuration with caching"""
+    current_time = datetime.now().timestamp()
+
+    # Check cache validity
+    if (hasattr(self, '_last_gateway_refresh') and
+        (current_time - self._last_gateway_refresh) < self.gateway_config_cache_ttl):
+        self.logger().debug("🔄 Using cached Gateway configuration")
+        return
+
+    # Refresh configuration
+    config_response = await self._read_gateway_config_files()
+    self._parse_pool_configurations(config_response["pools"])
+
+    self._last_gateway_refresh = current_time
+```
+
+### **3. Connection Pooling**
+```python
+# ✅ REUSE HTTP SESSIONS
+async def gateway_request(self, method: str, endpoint: str, data: Optional[Dict] = None):
+    """Gateway request with session reuse"""
+    timeout = aiohttp.ClientTimeout(total=self.request_timeout)
+
+    # Create new session for each request (aiohttp best practice)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.request(method, url, json=data, ssl=ssl_context) as response:
+            return await response.json()
+```
+
+---
+
+## 🔍 **MONITORING & DEBUGGING**
+
+### **1. Comprehensive Logging**
+```python
+# ✅ LOG LEVELS FOR DIFFERENT SCENARIOS
+self.logger().debug(f"🔍 Detailed state: {state}")        # Debug info
+self.logger().info(f"ℹ️ Normal operation: {action}")      # Info
+self.logger().warning(f"⚠️ Potential issue: {warning}")   # Warnings
+self.logger().error(f"❌ Error occurred: {error}")        # Errors
+
+# Transaction logging with explorer links
+tx_hash = event.exchange_trade_id
+explorer_url = self._get_blockchain_explorer_url(tx_hash, network)
+self.logger().info(f"✅ Transaction complete: {explorer_url}")
+```
+
+### **2. Performance Metrics Tracking**
+```python
+# ✅ TRACK KEY METRICS
+self.metrics = {
+    "trades_executed": 0,
+    "trades_failed": 0,
+    "successful_trades": 0,
+    "failed_trades": 0,
+    "avg_execution_time": 0.0,
+    "total_volume": Decimal("0"),
+    "daily_trade_count": 0,
+    "daily_volume": Decimal("0")
+}
+
+# Predictive selling metrics
+self.predictive_stats = {
+    'attempts': 0,
+    'successes': 0,
+    'failures': 0,
+    'fallback_success': 0
+}
+
+def log_predictive_stats(self):
+    """Log predictive selling performance"""
+    if self.predictive_stats['attempts'] > 0:
+        success_rate = (self.predictive_stats['successes'] /
+                       self.predictive_stats['attempts']) * 100
+
+        self.logger().info(
+            f"📊 Predictive Selling Stats:\n"
+            f"   Total: {self.predictive_stats['attempts']}\n"
+            f"   Successes: {self.predictive_stats['successes']} ({success_rate:.1f}%)\n"
+            f"   Failures: {self.predictive_stats['failures']}"
+        )
+```
+
+### **3. Status Reporting**
+```python
+# ✅ COMPREHENSIVE STATUS DISPLAY
+def format_status(self) -> str:
+    """Enhanced status for 'status --live' command"""
+    lines = ["📊 MQTT Webhook Strategy Status", "=" * 50]
+
+    # System Status
+    lines.extend(self._format_system_status())
+
+    # Trading Status
+    lines.extend(self._format_trading_status())
+
+    # Active Positions
+    lines.extend(self._format_active_positions())
+
+    # Performance Metrics
+    lines.extend(self._format_performance_metrics())
+
+    # Warnings
+    warning_lines = self._format_warnings()
+    if warning_lines:
+        lines.extend(["", "⚠️  WARNINGS ⚠️"] + warning_lines)
+
+    return "\n".join(lines)
+```
+
+---
+
+## 🎯 **PRODUCTION DEPLOYMENT CHECKLIST**
+
+### **Pre-Deployment**
+- [ ] All environment variables configured (.env.hummingbot)
+- [ ] API keys secured and tested (CEX, webhook)
+- [ ] Wallet balances verified (SOL for gas, USDC for trading)
+- [ ] Gateway certificates configured and tested
+- [ ] Gateway running and accessible (health check passed)
+- [ ] MQTT broker running and accessible
+- [ ] Webhook endpoint exposed (ngrok/cloudflare tunnel)
+- [ ] Pool configurations loaded (raydium.json, uniswap.json, etc.)
+- [ ] Token decimals loaded (ethereum.json, arbitrum.json, etc.)
+
+### **Deployment**
+- [ ] Start Gateway first (`gateway start`)
+- [ ] Verify Gateway health (`curl https://localhost:15888/`)
+- [ ] Start MQTT broker (`mosquitto -c mosquitto.conf`)
+- [ ] Launch webhook bridge (`node webhook-to-mqtt.js`)
+- [ ] Start Hummingbot with strategy (`./start -f mqtt_webhook_strategy_w_cex.py`)
+- [ ] Wait for initialization (Gateway config load, CEX connector ready)
+- [ ] Verify signal flow end-to-end (send test webhook)
+- [ ] Check first trade execution and database recording
+
+### **Post-Deployment**
+- [ ] Monitor first 10 trades closely (check logs and database)
+- [ ] Verify daily limits working (trade count, volume tracking)
+- [ ] Check gas protection active (SOL minimum balance)
+- [ ] Review execution logs for errors/warnings
+- [ ] Validate trade routing logic (CEX vs DEX)
+- [ ] Verify MarketsRecorder database entries
+- [ ] Test predictive selling (quick buy-sell cycle)
+- [ ] Check rate oracle updates for DEX positions
+- [ ] Monitor gas prices and transaction costs
+- [ ] Verify position tracking and cleanup
+
+### **Monitoring**
+- [ ] Setup log monitoring (tail -f logs/hummingbot.log)
+- [ ] Monitor database growth (trades, orders tables)
+- [ ] Track daily statistics (trades, volume, success rate)
+- [ ] Monitor Gateway performance (response times, errors)
+- [ ] Check MQTT connection stability
+- [ ] Review predictive selling statistics
+- [ ] Monitor gas usage and costs
+
+---
+
+## 🚀 **FUTURE ENHANCEMENTS**
+
+### **Planned Improvements**
+1. **0x Aggregator Integration** - EVM chain optimization with best routing
+2. **PancakeSwap Integration** - BSC support for BNB Chain trading
+3. **Multi-Strategy Support** - Run multiple strategies in parallel
+4. **Enhanced Analytics** - ML-based signal validation and prediction
+5. **Dynamic Position Sizing** - Risk-adjusted position sizing
+6. **Advanced Order Types** - Limit orders, stop-loss, take-profit
+7. **Portfolio Rebalancing** - Automatic portfolio optimization
+8. **Cross-DEX Arbitrage** - Detect and execute arbitrage opportunities
+
+### **Architecture Evolution**
+```python
+# Future multi-aggregator pattern
+aggregators = {
+    "solana": {
+        "primary": "jupiter",
+        "fallback": ["orca", "raydium"]
+    },
+    "ethereum": {
+        "primary": "0x",
+        "fallback": ["1inch", "uniswap"]
+    },
+    "arbitrum": {
+        "primary": "0x",
+        "fallback": ["uniswap", "sushiswap"]
+    },
+    "bsc": {
+        "primary": "pancakeswap",
+        "fallback": ["0x", "1inch"]
+    }
+}
+
+async def _get_best_route(self, network: str, trade_request: Dict) -> Dict:
+    """Get best route across multiple aggregators"""
+    primary = aggregators[network]["primary"]
+    fallbacks = aggregators[network]["fallback"]
+
+    # Try primary first
+    try:
+        return await self._get_quote(primary, trade_request)
+    except Exception:
+        # Try fallbacks
+        for aggregator in fallbacks:
+            try:
+                return await self._get_quote(aggregator, trade_request)
+            except Exception:
+                continue
+
+    raise Exception("No aggregator available")
+```
+
+---
+
+## 📝 **KEY TAKEAWAYS**
+
+### **Architecture**
+1. **Connector First**: Use Hummingbot's connector framework for automatic trade recording
+2. **Event-Driven**: OrderFilledEvent triggers cleanup and position management
+3. **Network Adapter**: One connector instance can trade on multiple chains
+4. **No Pair Inversion**: Both BUY and SELL use natural pair order (WBTC-USDC)
+
+### **Trading**
+5. **Type Safety**: Always use Decimal for money calculations
+6. **Gas Protection**: Critical for Solana - preserve minimum SOL balance
+7. **Predictive Selling**: Enable fast CEX buy-sell cycles without balance delays
+8. **Pool Type Hints**: Let webhook specify pool_type to eliminate guessing
+
+### **Operations**
+9. **Signal Validation**: Multi-layer security and configuration checks
+10. **Error Recovery**: Multiple fallback layers with exponential backoff
+11. **Performance**: Cache aggressively, use connection pooling
+12. **Monitoring**: Log everything, track key metrics, use status display
+
+### **Development**
+13. **Testing**: Start small ($1-2), test on devnet/testnet first
+14. **Documentation**: Keep best practices updated with production learnings
+15. **API Reference**: Keep API methods for queries, use connectors for trading
+16. **Rate Oracle**: Update with DEX prices for accurate PNL tracking
+
+---
+
+## 📚 **REFERENCES**
+
+### **Documentation**
+- Hummingbot Docs: https://docs.hummingbot.org
+- Gateway API: https://github.com/hummingbot/gateway
+- Connector Architecture: https://docs.hummingbot.org/developers/connectors/
+- Strategy Development: https://docs.hummingbot.org/developers/strategies/
+
+### **DEX/Aggregator Documentation**
+- Jupiter Docs: https://docs.jup.ag
+- 0x Docs: https://docs.0x.org
+- Uniswap V3: https://docs.uniswap.org/contracts/v3/overview
+- Raydium: https://docs.raydium.io
+- Meteora: https://docs.meteora.ag
+
+### **Exchange Documentation**
+- Coinbase Advanced Trade: https://docs.cloud.coinbase.com
+
+### **Infrastructure**
+- MQTT/Mosquitto: https://mosquitto.org/documentation/
+- ngrok: https://ngrok.com/docs
+- Docker: https://docs.docker.com
+
+---
+
+## 🔄 **MIGRATION GUIDE: API → Connector Architecture**
+
+### **Before (API-Based)**
+```python
+# OLD METHOD: Direct Gateway API calls
+async def _execute_swap_api(self, trade_request: Dict):
+    """DEPRECATED: Direct API swap execution"""
+    endpoint = f"/connectors/{exchange}/{pool_type}/swap"
+    response = await self.gateway_request("POST", endpoint, trade_request)
+
+    # Manual tracking required
+    if "signature" in response:
+        tx_hash = response["signature"]
+        # Must manually record to database
+        await self._record_trade_manually(tx_hash, trade_request)
+
+    return response
+```
+
+### **After (Connector-Based)**
+```python
+# NEW METHOD: Connector framework execution
+async def _execute_swap_connector(self, trade_request: Dict):
+    """CURRENT: Connector-based execution with automatic recording"""
+    connector = self._get_dex_connector(exchange, pool_type, network)
+
+    order_id = connector.place_order(
+        is_buy=is_buy,
+        trading_pair=trading_pair,
+        amount=amount,
+        price=price
+    )
+
+    # Track for event handling
+    self._dex_order_tracking[order_id] = {...}
+
+    # Framework handles:
+    # - Asynchronous execution
+    # - OrderFilledEvent trigger
+    # - Automatic database recording via MarketsRecorder
+    # - Position tracking and cleanup
+
+    return True
+```
+
+### **Migration Steps**
+1. Add connector declarations to `markets` dict
+2. Replace API swap calls with `connector.place_order()`
+3. Implement `did_fill_order()` event handler
+4. Remove manual database recording code
+5. Add order tracking dictionary (`_dex_order_tracking`)
+6. Test event flow with small trades
+7. Verify MarketsRecorder database entries
+8. Remove deprecated API methods
+
+---
+
+**Document Version**: 4.0 (Connector Architecture Update)
+**Last Updated**: October 11, 2025
+**Next Review**: November 2025 (0x Aggregator Integration)
+
+This document represents the current state of production best practices for the Hummingbot MQTT Webhook Strategy with connector-based architecture, multi-venue trading capabilities, and comprehensive event-driven execution.
