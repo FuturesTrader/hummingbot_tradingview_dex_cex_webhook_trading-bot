@@ -283,6 +283,16 @@ class EnhancedWebhookMQTTBridge:
             'okx': [
                 'mainnet',
                 'any'
+            ],
+            'hyperliquid': [
+                'arbitrum',  # Hyperliquid runs on Arbitrum
+                'mainnet',
+                'any'
+            ],
+            'hyperliquid_perpetual': [  # Alternative name
+                'arbitrum',
+                'mainnet',
+                'any'
             ]
         }
 
@@ -295,7 +305,7 @@ class EnhancedWebhookMQTTBridge:
             return jsonify({"error": error_msg}), 400
 
         # For CEX exchanges, accept any network value
-        if exchange in ['coinbase', 'binance', 'kraken', 'okx', 'bybit']:
+        if exchange in ['coinbase', 'binance', 'kraken', 'okx', 'bybit', 'hyperliquid', 'hyperliquid_perpetual']:
             # CEX doesn't care about network, so always pass
             return None
 

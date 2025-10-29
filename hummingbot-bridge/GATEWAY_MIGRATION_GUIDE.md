@@ -309,6 +309,164 @@ Swap execution error: fractional component exceeds decimals
 
 ---
 
+## 6. EVM Gas Fee Capture Fix (2025-10-13)
+
+### Bug: EVM Gas Fees Not Captured in Reports
+
+**Symptoms**:
+- Solana DEX trades (Jupiter, Raydium, Meteora) show gas fees correctly
+- EVM DEX trades (Uniswap, 0x on Ethereum, Arbitrum, Base, etc.) show 0.0 gas fees
+- Trades execute successfully, but reporting/analysis missing fee data
+- Database `TradeFill` table shows `flat_fees: [{"token": "WBTC", "amount": "0"}]` for EVM trades
+
+**Root Cause**:
+Gateway's Ethereum poll route returns `fee: null` instead of calculating gas fees from transaction receipts. The poll route at `gateway/src/chains/ethereum/routes/poll.ts:113` was hardcoded to return `null`:
+
+```typescript
+// BROKEN CODE:
+return {
+  currentBlock,
+  signature,
+  txBlock,
+  txStatus,
+  txData: toEthereumTransactionResponse(txData),
+  fee: null, // ← Hardcoded to null!
+};
+```
+
+**The Fix (Part 1): Calculate EVM Gas Fees**
+
+File: `gateway/src/chains/ethereum/routes/poll.ts` (after line 105, before the return statement)
+
+```typescript
+// Calculate gas fee from receipt if available
+let fee: number | null = null;
+if (txReceipt && txReceipt.gasUsed && txReceipt.effectiveGasPrice) {
+  // fee = gasUsed * effectiveGasPrice (in wei)
+  const feeWei = txReceipt.gasUsed.mul(txReceipt.effectiveGasPrice);
+  // Convert to native token units (ETH, MATIC, AVAX, etc.)
+  const feeEther = ethers.utils.formatEther(feeWei);
+  fee = parseFloat(feeEther);
+  logger.info(`Calculated transaction fee: ${fee} (gasUsed: ${txReceipt.gasUsed.toString()}, effectiveGasPrice: ${txReceipt.effectiveGasPrice.toString()})`);
+}
+
+return {
+  currentBlock,
+  signature,
+  txBlock,
+  txStatus,
+  txData: toEthereumTransactionResponse(txData),
+  fee,  // ← Now returns actual calculated fee
+};
+```
+
+**The Fix (Part 2): Add Missing TypeScript Type Definitions**
+
+The Gateway build was failing due to missing optional properties in config interfaces. These need to be added:
+
+File: `gateway/src/chains/ethereum/ethereum.config.ts`
+
+```typescript
+export interface EthereumNetworkConfig {
+  chainID: number;
+  nodeURL: string;
+  nativeCurrencySymbol: string;
+  minGasPrice?: number;
+  infuraAPIKey?: string;           // ← Add this
+  useInfuraWebSocket?: boolean;    // ← Add this
+}
+```
+
+File: `gateway/src/chains/solana/solana.config.ts`
+
+```typescript
+export interface SolanaNetworkConfig {
+  nodeURL: string;
+  nativeCurrencySymbol: string;
+  defaultComputeUnits: number;
+  confirmRetryInterval: number;
+  confirmRetryCount: number;
+  basePriorityFeePct: number;
+  minPriorityFeePerCU: number;
+  heliusAPIKey?: string;           // ← Add this
+  heliusRegionCode?: string;       // ← Add this
+  useHeliusRestRPC?: boolean;      // ← Add this
+  useHeliusWebSocketRPC?: boolean; // ← Add this
+  useHeliusSender?: boolean;       // ← Add this
+}
+```
+
+**How to Apply the Fix**:
+
+1. **Edit the Ethereum poll route**:
+   ```bash
+   cd gateway
+   # Edit src/chains/ethereum/routes/poll.ts
+   # Add the gas fee calculation code before the return statement (around line 107-116)
+   ```
+
+2. **Add missing type definitions**:
+   ```bash
+   # Edit src/chains/ethereum/ethereum.config.ts
+   # Add infuraAPIKey and useInfuraWebSocket to EthereumNetworkConfig interface
+
+   # Edit src/chains/solana/solana.config.ts
+   # Add heliusAPIKey, heliusRegionCode, useHeliusRestRPC, useHeliusWebSocketRPC,
+   # and useHeliusSender to SolanaNetworkConfig interface
+   ```
+
+3. **Build Gateway**:
+   ```bash
+   pnpm build
+   # Should complete successfully with no TypeScript errors
+   ```
+
+4. **Restart Gateway**:
+   ```bash
+   pnpm start --passphrase=<PASSPHRASE>
+   ```
+
+5. **Verify the fix**:
+   ```bash
+   # Test trades on both Solana and EVM
+   # Then check reports
+   cd ../hummingbot
+   python reporting/examples/export_reports.py
+
+   # Check fees in output
+   tail -10 reports/output/all_trades_*.csv
+   ```
+
+**Expected Results After Fix**:
+
+```
+Trade_ID | Exchange | Network  | Symbol      | Fee
+---------|----------|----------|-------------|-------------
+0        | Raydium  | Solana   | RAY-USDC    | 0.000035
+1        | Uniswap  | Ethereum | WBTC-USDC   | 0.000003609  ← Now shows gas fee!
+2        | Uniswap  | Arbitrum | WBTC-USDC   | 0.000001234  ← Now shows gas fee!
+```
+
+**How It Works**:
+
+1. **Hummingbot Strategy**: After trade fills, `mqtt_webhook_strategy_w_cex.py` calls `_fetch_and_update_gas_fee()` (line 426)
+2. **Gateway Query**: Strategy queries Gateway's poll endpoint for transaction status
+3. **Fee Calculation**: Gateway now calculates `gasUsed × effectiveGasPrice` and returns it
+4. **Database Update**: Strategy updates `TradeFill.trade_fee` JSON with actual gas cost
+5. **Reporting**: Export reports now show correct gas fees for both Solana and EVM trades
+
+**Why This Matters**:
+- Accurate PnL calculations require gas fee data
+- Tax reporting needs complete fee information
+- Performance analysis must account for transaction costs
+- Different networks have vastly different gas costs (Solana: ~$0.0001, Ethereum L1: ~$5-50, Arbitrum: ~$0.01)
+
+**Date Discovered**: 2025-10-13
+**Affected Gateway Versions**: dev-2.9.0 (all versions prior to fix)
+**Status**: **FIXED** - Required for accurate reporting
+
+---
+
 ## 6. Potential Breaking Changes to Watch For
 
 ### High Risk (Likely to require adaptation):
